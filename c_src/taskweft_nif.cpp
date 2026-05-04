@@ -141,6 +141,26 @@ std::string check_temporal(ErlNifEnv *p_env, std::string p_domain_json,
 }
 FINE_NIF(check_temporal, 0);
 
+// plan_with_temporal(domain_json, origin_iso) → plan_with_temporal_json
+// Combines plan() + check_temporal() in one NIF call; temporal is primary.
+// Returns the same JSON envelope as tw_temporal_to_json.
+// Raises ErlangError on failure or no-plan.
+std::string plan_with_temporal(ErlNifEnv *p_env, std::string p_domain_json,
+		std::string p_origin_iso) {
+	TwLoader::TwLoaded loaded = load_cached(p_domain_json);
+	if (!loaded.state) {
+		throw std::runtime_error("failed_to_load_domain");
+	}
+	std::optional<std::vector<TwCall>> result = tw_plan(loaded.state, loaded.tasks, loaded.domain);
+	if (!result) {
+		throw std::runtime_error("no_plan");
+	}
+	std::string plan_json = TwLoader::plan_to_json(*result);
+	TwTemporalResult tr = tw_check_temporal(*result, loaded.domain, p_origin_iso);
+	return tw_temporal_to_json(*result, tr, plan_json);
+}
+FINE_NIF(plan_with_temporal, 0);
+
 // domain_cache_clear() → :ok
 // Evicts all cached parsed domains. Call when domain JSON will not be reused.
 std::string domain_cache_clear(ErlNifEnv *p_env) {

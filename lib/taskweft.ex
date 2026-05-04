@@ -56,8 +56,8 @@ defmodule Taskweft do
   alias Taskweft.NIF
   alias Taskweft.ReBAC
 
-  def plan(domain_json) do
-    {:ok, NIF.plan(domain_json)}
+  def plan(domain_json, origin_iso \\ "PT0S") do
+    {:ok, NIF.plan_with_temporal(domain_json, origin_iso)}
   rescue
     e -> {:error, Exception.message(e)}
   end

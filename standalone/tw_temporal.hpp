@@ -1,70 +1,160 @@
 // RECTGTN 'T' — Temporal: ISO 8601 duration parsing, STN consistency, plan timing.
 // Mirrors Python ipyhop/temporal/stn.py and temporal_metadata.py.
+//
+// tw_parse_duration_ms: ISO 8601-1:2019 §5.5.2.4 compliant; mirrors
+// lean/Planner/Iso8601Duration.lean.  Canonical order Y→Mo→D→H→Mi→S,
+// fractions on lowest-order unit only, integer millisecond arithmetic.
 #pragma once
 #include "tw_domain.hpp"
-#include <cmath>
+#include <cstdint>
 #include <sstream>
 #include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-// Parse ISO 8601 time-duration string (PTxHxMxS) → total seconds.
-// Only handles the time part (PT prefix); day/year/month not supported.
-// Returns -1.0 on parse failure.
-inline double tw_parse_duration(const std::string &dur) {
-    if (dur.size() < 2 || dur[0] != 'P') return -1.0;
-    size_t i = 1;
-    // Skip optional 'T' time designator
-    if (i < dur.size() && dur[i] == 'T') ++i;
-    double total = 0.0;
+// Unit milliseconds (Timex conventions: 1Y=365d, 1Mo=30d, 1W=7d).
+namespace tw_duration_detail {
+static constexpr int64_t MS_Y  = 365LL * 86400 * 1000;
+static constexpr int64_t MS_MO =  30LL * 86400 * 1000;
+static constexpr int64_t MS_W  =   7LL * 86400 * 1000;
+static constexpr int64_t MS_D  =        86400LL * 1000;
+static constexpr int64_t MS_H  =         3600LL * 1000;
+static constexpr int64_t MS_MI =           60LL * 1000;
+static constexpr int64_t MS_S  =                  1000;
+} // namespace tw_duration_detail
+
+// Parse ISO 8601 duration → total milliseconds.
+// Handles P[nY][nM][nD][T[nH][nM][nS]] and PnW.
+// "P" alone returns 0.  Returns -1 on any parse error.
+inline int64_t tw_parse_duration_ms(const std::string &dur) {
+    using namespace tw_duration_detail;
+    if (dur.empty() || dur[0] != 'P') return -1;
+    if (dur.size() == 1) return 0; // "P" = zero duration
+
+    size_t  i          = 1;
+    int64_t total_ms   = 0;
+    bool    in_time    = false;
+    bool    saw_t      = false;
+    bool    frac_seen  = false;
+    bool    saw_w      = false;
+    bool    saw_any    = false;
+    int     last_rank  = -1;
+
     while (i < dur.size()) {
-        double val = 0.0;
-        bool has_digit = false;
-        // Integer part
-        while (i < dur.size() && std::isdigit((unsigned char)dur[i])) {
-            has_digit = true;
-            val = val * 10.0 + (dur[i++] - '0');
+        if (frac_seen) return -1; // fractionNotOnLast
+
+        if (dur[i] == 'T') {
+            if (saw_t)         return -1; // duplicateT
+            if (i + 1 >= dur.size()) return -1; // unexpectedEnd
+            saw_t   = true;
+            in_time = true;
+            // lastRank carried through (H rank=3 > D rank=2 naturally)
+            ++i;
+            continue;
         }
-        // Fractional part
+
+        if (!std::isdigit((unsigned char)dur[i])) return -1; // unexpectedToken
+
+        // Integer part
+        int64_t whole = 0;
+        while (i < dur.size() && std::isdigit((unsigned char)dur[i]))
+            whole = whole * 10 + (dur[i++] - '0');
+
+        // Optional fraction (max 3 digits; remainder truncated)
+        int64_t frac_milli = 0;
+        bool    has_frac   = false;
         if (i < dur.size() && dur[i] == '.') {
             ++i;
-            double frac = 0.1;
-            while (i < dur.size() && std::isdigit((unsigned char)dur[i])) {
-                val += (dur[i++] - '0') * frac;
-                frac *= 0.1;
+            if (i >= dur.size() || !std::isdigit((unsigned char)dur[i]))
+                return -1; // invalidNumber: trailing dot
+            has_frac = true;
+            int64_t acc = 0, n = 0;
+            while (i < dur.size() && std::isdigit((unsigned char)dur[i]) && n < 3) {
+                acc = acc * 10 + (dur[i++] - '0');
+                ++n;
             }
+            while (i < dur.size() && std::isdigit((unsigned char)dur[i])) ++i; // excess
+            for (int64_t k = n; k < 3; ++k) acc *= 10;
+            frac_milli = acc;
         }
-        if (!has_digit || i >= dur.size()) break;
-        char unit = dur[i++];
-        if      (unit == 'H') total += val * 3600.0;
-        else if (unit == 'M') total += val * 60.0;
-        else if (unit == 'S') total += val;
+
+        if (i >= dur.size()) return -1; // number with no unit
+        char unit_c = dur[i++];
+
+        // Classify unit → (rank, unit_ms)
+        int     rank;
+        int64_t unit_ms;
+        if (!in_time) {
+            if      (unit_c == 'Y') { rank = 0;  unit_ms = MS_Y;  }
+            else if (unit_c == 'M') { rank = 1;  unit_ms = MS_MO; }
+            else if (unit_c == 'W') { rank = 99; unit_ms = MS_W;  }
+            else if (unit_c == 'D') { rank = 2;  unit_ms = MS_D;  }
+            else return -1; // wrong-side or unknown unit
+        } else {
+            if      (unit_c == 'H') { rank = 3; unit_ms = MS_H;  }
+            else if (unit_c == 'M') { rank = 4; unit_ms = MS_MI; }
+            else if (unit_c == 'S') { rank = 5; unit_ms = MS_S;  }
+            else return -1;
+        }
+
+        // W must stand alone (mixedBasicExtended)
+        if (unit_c == 'W' && (saw_any || in_time)) return -1;
+        if (saw_w) return -1;
+        if (unit_c == 'W') saw_w = true;
+
+        // Canonical order (nonCanonicalOrder)
+        if (rank != 99 && rank <= last_rank) return -1;
+        last_rank = (rank == 99) ? last_rank : rank;
+
+        total_ms += whole * unit_ms;
+        if (has_frac) {
+            total_ms += frac_milli * (unit_ms / 1000);
+            frac_seen = true;
+        }
+        saw_any = true;
     }
-    return total;
+
+    return total_ms;
 }
 
-// Format total seconds → ISO 8601 duration string (PTxHxMxS).
-inline std::string tw_format_duration(double seconds) {
-    if (seconds < 0.0) seconds = 0.0;
-    int h = (int)(seconds / 3600.0);
-    seconds -= h * 3600.0;
-    int m = (int)(seconds / 60.0);
-    seconds -= m * 60.0;
+// Legacy shim: parse ISO 8601 duration → seconds (double).
+// Kept for callers that still use the old signature.  New code should
+// prefer tw_parse_duration_ms and work in milliseconds.
+inline double tw_parse_duration(const std::string &dur) {
+    int64_t ms = tw_parse_duration_ms(dur);
+    return ms < 0 ? -1.0 : static_cast<double>(ms) / 1000.0;
+}
 
-    std::string s = "PT";
-    if (h > 0) s += std::to_string(h) + "H";
-    if (m > 0) s += std::to_string(m) + "M";
-    if (seconds > 0.0 || (h == 0 && m == 0)) {
-        if (seconds == (double)(int)seconds)
-            s += std::to_string((int)seconds) + "S";
-        else {
-            char buf[32];
-            std::snprintf(buf, sizeof(buf), "%.6gS", seconds);
-            s += buf;
+// Format milliseconds → ISO 8601 duration string (integer arithmetic only).
+inline std::string tw_format_duration_ms(int64_t ms) {
+    if (ms < 0) ms = 0;
+    int64_t total_s = ms / 1000;
+    int64_t milli   = ms % 1000;
+    int64_t h = total_s / 3600; total_s -= h * 3600;
+    int64_t m = total_s / 60;
+    int64_t s = total_s % 60;
+
+    std::string out = "PT";
+    if (h > 0) out += std::to_string(h) + "H";
+    if (m > 0) out += std::to_string(m) + "M";
+    if (s > 0 || milli > 0 || (h == 0 && m == 0)) {
+        out += std::to_string(s);
+        if (milli > 0) {
+            char buf[8];
+            int  len = std::snprintf(buf, sizeof(buf), ".%03lld", (long long)milli);
+            while (len > 1 && buf[len - 1] == '0') --len;
+            buf[len] = '\0';
+            out += buf;
         }
+        out += "S";
     }
-    return s;
+    return out;
+}
+
+// Legacy shim: seconds → ISO 8601 string.
+inline std::string tw_format_duration(double seconds) {
+    return tw_format_duration_ms(static_cast<int64_t>(seconds * 1000.0 + 0.5));
 }
 
 // STN is an implementation detail — hidden from callers.
@@ -135,7 +225,6 @@ struct TwTemporalResult {
 // Sequential assumption: each action starts exactly when the previous ends.
 // Actions with no duration entry are treated as PT0S.
 // origin_iso: ISO 8601 duration string for the plan start offset (default "PT0S").
-// All start_iso/end_iso values are durations measured from the same zero reference.
 inline TwTemporalResult tw_check_temporal(
         const std::vector<TwCall> &plan,
         const TwDomain            &domain,
@@ -144,8 +233,8 @@ inline TwTemporalResult tw_check_temporal(
     r.consistent = true;
     r.origin_iso = origin_iso;
 
-    double origin_s = tw_parse_duration(origin_iso);
-    if (origin_s < 0.0) origin_s = 0.0;
+    int64_t origin_ms = tw_parse_duration_ms(origin_iso);
+    if (origin_ms < 0) origin_ms = 0;
 
     if (plan.empty()) {
         r.total_iso = "PT0S";
@@ -154,42 +243,42 @@ inline TwTemporalResult tw_check_temporal(
 
     tw_detail::STN stn;
     stn.add_point("t0");
-    std::string prev_end = "t0";
-    double current_s     = origin_s;
-    double total_s       = 0.0;
+    std::string prev_end  = "t0";
+    int64_t     current   = origin_ms;
+    int64_t     total_ms  = 0;
 
     for (size_t i = 0; i < plan.size(); ++i) {
         const std::string &name = plan[i].name;
 
-        double dur_s = 0.0;
+        int64_t     dur_ms  = 0;
         std::string dur_iso;
-        std::unordered_map<std::string, std::string>::const_iterator dit =
-            domain.action_durations.find(name);
+        auto dit = domain.action_durations.find(name);
         if (dit != domain.action_durations.end()) {
-            dur_iso = dit->second;
-            double parsed = tw_parse_duration(dur_iso);
-            if (parsed >= 0.0) dur_s = parsed;
+            dur_iso       = dit->second;
+            int64_t parsed = tw_parse_duration_ms(dur_iso);
+            if (parsed >= 0) dur_ms = parsed;
         }
 
         TwTemporalStep step;
         step.action_name  = name;
         step.duration_iso = dur_iso.empty() ? "PT0S" : dur_iso;
-        step.start_iso    = tw_format_duration(current_s);
-        step.end_iso      = tw_format_duration(current_s + dur_s);
+        step.start_iso    = tw_format_duration_ms(current);
+        step.end_iso      = tw_format_duration_ms(current + dur_ms);
         r.steps.push_back(std::move(step));
 
-        current_s += dur_s;
-        total_s   += dur_s;
+        current  += dur_ms;
+        total_ms += dur_ms;
 
-        std::string a_start = "a" + std::to_string(i) + "_start";
-        std::string a_end   = "a" + std::to_string(i) + "_end";
-        stn.add_constraint(prev_end, a_start, 0.0, 0.0);
-        stn.add_constraint(a_start,  a_end,   dur_s, dur_s);
-        prev_end = a_end;
+        double dur_s    = static_cast<double>(dur_ms) / 1000.0;
+        std::string a_s = "a" + std::to_string(i) + "_start";
+        std::string a_e = "a" + std::to_string(i) + "_end";
+        stn.add_constraint(prev_end, a_s, 0.0, 0.0);
+        stn.add_constraint(a_s,      a_e, dur_s, dur_s);
+        prev_end = a_e;
     }
 
     r.consistent = stn.consistent();
-    r.total_iso  = tw_format_duration(total_s);
+    r.total_iso  = tw_format_duration_ms(total_ms);
     return r;
 }
 
