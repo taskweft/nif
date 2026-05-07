@@ -550,28 +550,6 @@ inline TwValue eval_expr(const TwValue &expr, const Params &params,
     return resolve_param(expr, params);
 }
 
-// Detect which comparison operator a check step uses.
-inline std::string check_op(const TwValue::Dict &step) {
-    for (const char *op : {"eq","neq","lt","le","gt","ge","ieq","ilt","ile","igt","ige"})
-        if (step.count(op)) return op;
-    return "eq";
-}
-
-inline bool compare_values(const TwValue &actual, const TwValue &expected,
-        const std::string &op) {
-    if (op == "eq"  || op == "ieq") {
-        if (actual.is_number() && expected.is_number())
-            return actual.as_number() == expected.as_number();
-        return actual == expected;
-    }
-    if (op == "neq") return actual != expected;
-    if (op == "lt"  || op == "ilt") return actual <  expected;
-    if (op == "le"  || op == "ile") return actual <= expected;
-    if (op == "gt"  || op == "igt") return actual >  expected;
-    if (op == "ge"  || op == "ige") return actual >= expected;
-    return false;
-}
-
 // ---- Domain building helpers -----------------------------------------------
 
 inline Params build_params(const TwValue::Array &names, const std::vector<TwValue> &args) {
@@ -596,45 +574,17 @@ inline void run_binds(const TwValue::Array &binds, Params &params, const TwState
 
 inline bool run_checks(const TwValue::Array &checks, const Params &params,
         const TwState &state, const TwValue::Dict &enums) {
+    // Method-alternative and goal-method check clauses are glTF Interactivity
+    // node evaluations. Each clause is `{"eval": <node>}`; a clause whose
+    // result is anything other than boolean true fails the alternative.
+    // Issue #50 phase 3 — legacy `{"pointer": "/x", "<op>": v}` shape removed.
     for (auto &step : checks) {
         if (!step.is_dict()) return false;
         const auto &cs = step.as_dict();
-
-        // "eval" step: evaluate a KHR_interactivity node expression
-        // {"eval": {"type": "math/and", "a": ..., "b": ...}}
         auto eval_it = cs.find("eval");
-        if (eval_it != cs.end()) {
-            TwValue result = eval_expr(eval_it->second, params, state, enums);
-            if (!result.is_bool() || !result.as_bool()) return false;
-            continue;
-        }
-
-        std::pair<std::string, TwValue> ptr;
-        auto ptr_it = cs.find("pointer");
-        auto var_it = cs.find("var");
-        if (ptr_it != cs.end()) {
-            ptr = parse_pointer(ptr_it->second.as_string(), params);
-        } else if (var_it != cs.end()) {
-            auto &raw = var_it->second;
-            if (raw.is_string())
-                ptr = parse_pointer(raw.as_string(), params);
-            else if (raw.is_array() && raw.as_array().size() == 2) {
-                std::string vname = raw.as_array()[0].as_string();
-                if (!vname.empty() && vname[0] == '/') vname = vname.substr(1);
-                ptr = {std::move(vname), resolve_param(raw.as_array()[1], params)};
-            }
-            else return false;
-        } else return false;
-
-        if (ptr.first.empty()) return false;
-
-        TwValue actual   = state.get_nested(ptr.first, ptr.second);
-        std::string op   = check_op(cs);
-        auto op_it       = cs.find(op);
-        if (op_it == cs.end()) return false;
-        TwValue expected = resolve_param(op_it->second, params);
-
-        if (!compare_values(actual, expected, op)) return false;
+        if (eval_it == cs.end()) return false;
+        TwValue result = eval_expr(eval_it->second, params, state, enums);
+        if (!result.is_bool() || !result.as_bool()) return false;
     }
     return true;
 }
@@ -677,25 +627,17 @@ inline TwActionFn build_action(const TwValue::Dict &def, const TwValue::Dict &en
             if (!step.is_dict()) return nullptr;
             const auto &s = step.as_dict();
 
-            // Standard glTF Interactivity step keys; legacy "set" / "check"
-            // shorthand still accepted during migration window (issue #50).
-            auto eval_it  = s.find("eval");
-            auto check_it = s.find("check");
-            auto set_it   = s.find("pointer/set");
-            if (set_it == s.end()) set_it = s.find("set");
+            // RECTGTN exposes exactly two action body primitives:
+            //   - eval:        evaluate a glTF Interactivity node; action
+            //                  fails if the result is false
+            //   - pointer/set: write state at a JSON-pointer path
+            // Anything else is a malformed step and aborts the action.
+            auto eval_it = s.find("eval");
+            auto set_it  = s.find("pointer/set");
 
             if (eval_it != s.end()) {
                 TwValue result = eval_expr(eval_it->second, params, *new_state, enums);
                 if (!result.is_bool() || !result.as_bool()) return nullptr;
-            } else if (check_it != s.end()) {
-                auto [var, key] = parse_pointer(check_it->second.as_string(), params);
-                if (var.empty()) return nullptr;
-                TwValue actual   = new_state->get_nested(var, key);
-                std::string op   = check_op(s);
-                auto op_it       = s.find(op);
-                if (op_it == s.end()) return nullptr;
-                TwValue expected = eval_expr(op_it->second, params, *new_state, enums);
-                if (!compare_values(actual, expected, op)) return nullptr;
             } else if (set_it != s.end()) {
                 auto [var, key] = parse_pointer(set_it->second.as_string(), params);
                 if (var.empty()) return nullptr;
@@ -703,6 +645,8 @@ inline TwActionFn build_action(const TwValue::Dict &def, const TwValue::Dict &en
                 if (val_it == s.end()) return nullptr;
                 TwValue value = eval_expr(val_it->second, params, *new_state, enums);
                 new_state->set_nested(var, key, std::move(value));
+            } else {
+                return nullptr;
             }
         }
         return new_state;
