@@ -3,13 +3,55 @@
 #pragma once
 #include "tw_domain.hpp"
 #include "tw_soltree.hpp"
+#include <chrono>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 static constexpr int TW_MAX_DEPTH = 256;
+
+// Default planner wall-clock budget — the industry-standard knob for
+// bounding HTN search instead of relying solely on a static depth limit.
+// Adversarial or pathological domains hit the wall clock long before any
+// sensible depth, so this is the real DoS guard.
+static constexpr std::chrono::milliseconds TW_DEFAULT_BUDGET{5000};
+
+// Granularity at which `tw_seek_plan` consults the wall clock. One probe
+// per recursion entry would work but `steady_clock::now()` costs ~10ns
+// on Apple silicon and the planner is microsecond-scale on legitimate
+// inputs; sampling every 256 entries keeps the overhead invisible while
+// still bounding adversarial loops to ~µs of overshoot.
+static constexpr int TW_BUDGET_SAMPLE_EVERY = 256;
+
+struct TwBudget {
+    std::chrono::steady_clock::time_point deadline;
+    int                                   tick   = 0;
+    bool                                  fired  = false;
+
+    static TwBudget from_now(std::chrono::milliseconds ms) {
+        return TwBudget{std::chrono::steady_clock::now() + ms, 0, false};
+    }
+
+    bool exceeded() {
+        if (fired) return true;
+        if ((++tick % TW_BUDGET_SAMPLE_EVERY) != 0) return false;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            fired = true;
+            return true;
+        }
+        return false;
+    }
+};
+
+// Thrown out of `tw_seek_plan` when the wall-clock budget is exhausted.
+// NIF callers translate to a distinct error so consumers can tell
+// "no plan exists" from "we ran out of time".
+struct TwBudgetExceeded : std::runtime_error {
+    TwBudgetExceeded() : std::runtime_error("planner_time_budget_exceeded") {}
+};
 
 // Serialize a TwCall to a canonical string key for blacklist membership tests.
 // Mirrors Python's tuple identity: ("action_name", arg1, arg2, ...).
@@ -30,8 +72,10 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan(
         std::vector<TwTask>      tasks,
         const TwDomain           &domain,
         int                      depth = 0,
-        const TwBlacklist       *blacklist = nullptr) {
+        const TwBlacklist       *blacklist = nullptr,
+        TwBudget                *budget = nullptr) {
 
+    if (budget && budget->exceeded()) throw TwBudgetExceeded{};
     if (depth > TW_MAX_DEPTH) return std::nullopt;
     if (tasks.empty()) return std::vector<TwCall>{};
 
@@ -40,7 +84,7 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan(
     // --- Conjunctive goal (unigoal) ---
     if (TwGoal *goal = std::get_if<TwGoal>(&tasks[0])) {
         if (goal->is_satisfied(*state))
-            return tw_seek_plan(state, remaining, domain, depth + 1, blacklist);
+            return tw_seek_plan(state, remaining, domain, depth + 1, blacklist, budget);
 
         std::vector<TwGoalBinding> unmet = goal->unsatisfied(*state);
         if (unmet.empty()) return std::nullopt;
@@ -60,7 +104,7 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan(
             new_tasks.push_back(*goal);
             new_tasks.insert(new_tasks.end(), remaining.begin(), remaining.end());
             std::optional<std::vector<TwCall>> result =
-                tw_seek_plan(state, new_tasks, domain, depth + 1, blacklist);
+                tw_seek_plan(state, new_tasks, domain, depth + 1, blacklist, budget);
             if (result) return result;
         }
         return std::nullopt;
@@ -69,7 +113,7 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan(
     // --- Multigoal (RECTGTN 'N'): backtrack over which binding to satisfy first ---
     if (TwMultiGoal *mg = std::get_if<TwMultiGoal>(&tasks[0])) {
         if (mg->is_satisfied(*state))
-            return tw_seek_plan(state, remaining, domain, depth + 1, blacklist);
+            return tw_seek_plan(state, remaining, domain, depth + 1, blacklist, budget);
 
         std::vector<TwGoalBinding> unmet = mg->unsatisfied(*state);
         if (unmet.empty()) return std::nullopt;
@@ -84,7 +128,7 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan(
             new_tasks.push_back(*mg);
             new_tasks.insert(new_tasks.end(), remaining.begin(), remaining.end());
             std::optional<std::vector<TwCall>> result =
-                tw_seek_plan(state, new_tasks, domain, depth + 1, blacklist);
+                tw_seek_plan(state, new_tasks, domain, depth + 1, blacklist, budget);
             if (result) return result;
         }
         return std::nullopt;
@@ -104,7 +148,7 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan(
         std::shared_ptr<TwState> new_state = ait->second(state->copy(), call.args);
         if (!new_state) return std::nullopt;
         std::optional<std::vector<TwCall>> sub =
-            tw_seek_plan(new_state, remaining, domain, depth + 1, blacklist);
+            tw_seek_plan(new_state, remaining, domain, depth + 1, blacklist, budget);
         if (!sub) return std::nullopt;
         std::vector<TwCall> plan = {call};
         plan.insert(plan.end(), sub->begin(), sub->end());
@@ -122,7 +166,7 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan(
             new_tasks.insert(new_tasks.end(), subs->begin(), subs->end());
             new_tasks.insert(new_tasks.end(), remaining.begin(), remaining.end());
             std::optional<std::vector<TwCall>> result =
-                tw_seek_plan(state, new_tasks, domain, depth + 1, blacklist);
+                tw_seek_plan(state, new_tasks, domain, depth + 1, blacklist, budget);
             if (result) return result;
         }
         return std::nullopt;
@@ -132,11 +176,13 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan(
 }
 
 inline std::optional<std::vector<TwCall>> tw_plan(
-        std::shared_ptr<TwState> state,
-        std::vector<TwTask>      tasks,
-        const TwDomain           &domain,
-        const TwBlacklist       *blacklist = nullptr) {
-    return tw_seek_plan(std::move(state), std::move(tasks), domain, 0, blacklist);
+        std::shared_ptr<TwState>   state,
+        std::vector<TwTask>        tasks,
+        const TwDomain            &domain,
+        const TwBlacklist         *blacklist = nullptr,
+        std::chrono::milliseconds  budget_ms = TW_DEFAULT_BUDGET) {
+    TwBudget budget = TwBudget::from_now(budget_ms);
+    return tw_seek_plan(std::move(state), std::move(tasks), domain, 0, blacklist, &budget);
 }
 
 // ── Tree-building planner ───────────────────────────────────────────────────
@@ -153,8 +199,10 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan_tree(
         int                        tree_parent,
         int                        depth      = 0,
         const TwBlacklist         *blacklist   = nullptr,
-        const TwMethodSkip        *method_skip = nullptr) {
+        const TwMethodSkip        *method_skip = nullptr,
+        TwBudget                  *budget      = nullptr) {
 
+    if (budget && budget->exceeded()) throw TwBudgetExceeded{};
     if (depth > TW_MAX_DEPTH) return std::nullopt;
     if (tasks.empty()) return std::vector<TwCall>{};
 
@@ -164,7 +212,7 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan_tree(
     if (TwGoal *goal = std::get_if<TwGoal>(&tasks[0])) {
         if (goal->is_satisfied(*state))
             return tw_seek_plan_tree(state, remaining, domain, tree, tree_parent,
-                                     depth + 1, blacklist, method_skip);
+                                     depth + 1, blacklist, method_skip, budget);
 
         std::vector<TwGoalBinding> unmet = goal->unsatisfied(*state);
         if (unmet.empty()) return std::nullopt;
@@ -202,7 +250,7 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan_tree(
             new_tasks.insert(new_tasks.end(), remaining.begin(), remaining.end());
             std::optional<std::vector<TwCall>> result =
                 tw_seek_plan_tree(state, new_tasks, domain, tree, next_p,
-                                  depth + 1, blacklist, method_skip);
+                                  depth + 1, blacklist, method_skip, budget);
             if (result) return result;
             if (tree) tree->restore(cp);
         }
@@ -213,7 +261,7 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan_tree(
     if (TwMultiGoal *mg = std::get_if<TwMultiGoal>(&tasks[0])) {
         if (mg->is_satisfied(*state))
             return tw_seek_plan_tree(state, remaining, domain, tree, tree_parent,
-                                     depth + 1, blacklist, method_skip);
+                                     depth + 1, blacklist, method_skip, budget);
 
         std::vector<TwGoalBinding> unmet = mg->unsatisfied(*state);
         if (unmet.empty()) return std::nullopt;
@@ -227,7 +275,7 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan_tree(
             new_tasks.insert(new_tasks.end(), remaining.begin(), remaining.end());
             std::optional<std::vector<TwCall>> result =
                 tw_seek_plan_tree(state, new_tasks, domain, tree, tree_parent,
-                                  depth + 1, blacklist, method_skip);
+                                  depth + 1, blacklist, method_skip, budget);
             if (result) return result;
         }
         return std::nullopt;
@@ -256,7 +304,7 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan_tree(
 
         std::optional<std::vector<TwCall>> sub =
             tw_seek_plan_tree(new_state, remaining, domain, tree, tree_parent,
-                              depth + 1, blacklist, method_skip);
+                              depth + 1, blacklist, method_skip, budget);
         if (!sub) {
             if (tree) tree->restore(cp);
             return std::nullopt;
@@ -292,7 +340,7 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan_tree(
             new_tasks.insert(new_tasks.end(), remaining.begin(), remaining.end());
             std::optional<std::vector<TwCall>> result =
                 tw_seek_plan_tree(state, new_tasks, domain, tree, next_p,
-                                  depth + 1, blacklist, method_skip);
+                                  depth + 1, blacklist, method_skip, budget);
             if (result) return result;
             if (tree) tree->restore(cp);
         }
@@ -306,18 +354,20 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan_tree(
 // The tree can be passed to tw_replan_incremental to backtrack at the exact
 // method choice point rather than restarting the full search.
 inline std::optional<std::vector<TwCall>> tw_plan_with_tree(
-        std::shared_ptr<TwState>  state,
-        std::vector<TwTask>       tasks,
+        std::shared_ptr<TwState>   state,
+        std::vector<TwTask>        tasks,
         const TwDomain            &domain,
         TwSolTree                 &out_tree,
         const TwBlacklist         *blacklist   = nullptr,
-        const TwMethodSkip        *method_skip = nullptr) {
+        const TwMethodSkip        *method_skip = nullptr,
+        std::chrono::milliseconds  budget_ms   = TW_DEFAULT_BUDGET) {
     out_tree.nodes.clear();
     out_tree.action_nodes.clear();
     TwSolNode root;
     root.kind   = TwSolNode::Kind::Root;
     root.parent = -1;
     out_tree.nodes.push_back(root);
+    TwBudget budget = TwBudget::from_now(budget_ms);
     return tw_seek_plan_tree(std::move(state), std::move(tasks), domain,
-                             &out_tree, 0, 0, blacklist, method_skip);
+                             &out_tree, 0, 0, blacklist, method_skip, &budget);
 }
