@@ -262,6 +262,15 @@ inline const std::unordered_map<std::string, NodeFn> &kNodeTypes() {
         {"max",  [](auto a, auto b, auto, auto) -> TwValue { return a > b ? a : b; }},
         {"saturate", [](auto a, auto, auto, auto) -> TwValue {
             double v = a.as_number(); return TwValue(v < 0.0 ? 0.0 : v > 1.0 ? 1.0 : v); }},
+        // math/smoothStep(a,b,c) — Hermite interpolation, defined in terms of
+        // math/min + math/saturate (spec §Smooth Step). See lean/KHRTier1Witness.lean
+        // for the witness-certified reference model this mirrors.
+        {"smoothStep", [](auto a, auto b, auto c, auto) -> TwValue {
+            double av = a.as_number(), bv = b.as_number(), cv = c.as_number();
+            double mn = std::min(av, bv);
+            double raw = (cv - mn) / std::abs(bv - av);
+            double t = raw < 0.0 ? 0.0 : raw > 1.0 ? 1.0 : raw;
+            return TwValue(t * t * (3.0 - 2.0 * t)); }},
 
         // ---- Sign/rounding -------------------------------------------------
         {"sign", [](auto a, auto, auto, auto) -> TwValue {
@@ -325,6 +334,7 @@ inline const std::unordered_map<std::string, NodeFn> &kNodeTypes() {
         // ---- Constants ----------------------------------------------------
         {"E",   [](auto, auto, auto, auto) -> TwValue { return TwValue(M_E); }},
         {"Pi",  [](auto, auto, auto, auto) -> TwValue { return TwValue(M_PI); }},
+        {"Tau", [](auto, auto, auto, auto) -> TwValue { return TwValue(2.0 * M_PI); }},
         {"Inf", [](auto, auto, auto, auto) -> TwValue { return TwValue(std::numeric_limits<double>::infinity()); }},
         {"NaN", [](auto, auto, auto, auto) -> TwValue { return TwValue(std::numeric_limits<double>::quiet_NaN()); }},
 
@@ -376,6 +386,36 @@ inline const std::unordered_map<std::string, NodeFn> &kNodeTypes() {
             if (!a.is_array()) return TwValue{};
             size_t i = (size_t)b.as_int();
             return i < a.as_array().size() ? a.as_array()[i] : TwValue{}; }},
+        // math/extract2x2/3x3/4x4 — matrices are flat row-major arrays, so
+        // this is index-for-index identical to extract2/3/4.
+        {"extract2x2", [](auto a, auto b, auto, auto) -> TwValue {
+            if (!a.is_array()) return TwValue{};
+            size_t i = (size_t)b.as_int();
+            return i < a.as_array().size() ? a.as_array()[i] : TwValue{}; }},
+        {"extract3x3", [](auto a, auto b, auto, auto) -> TwValue {
+            if (!a.is_array()) return TwValue{};
+            size_t i = (size_t)b.as_int();
+            return i < a.as_array().size() ? a.as_array()[i] : TwValue{}; }},
+        {"extract4x4", [](auto a, auto b, auto, auto) -> TwValue {
+            if (!a.is_array()) return TwValue{};
+            size_t i = (size_t)b.as_int();
+            return i < a.as_array().size() ? a.as_array()[i] : TwValue{}; }},
+        // math/combine2x2 — pack 4 floats (row-major) into a 2x2 matrix.
+        // Fits the existing 4-arg (a,b,c,d) convention, unlike combine3x3/4x4
+        // which need more than 4 named inputs and are handled as structural
+        // nodes in eval_node() instead.
+        {"combine2x2", [](auto a, auto b, auto c, auto d) -> TwValue {
+            return TwValue(TwValue::Array{a, b, c, d}); }},
+        // math/rotate2D(a=float2, angle) — 2D rotation. See
+        // lean/KHRTier1Witness.lean for the length-preservation witness this
+        // mirrors.
+        {"rotate2D", [](auto a, auto angle, auto, auto) -> TwValue {
+            if (!a.is_array() || a.as_array().size() < 2) return TwValue{};
+            double ax = a.as_array()[0].as_number(), ay = a.as_array()[1].as_number();
+            double t = angle.as_number();
+            double s = std::sin(t), cc = std::cos(t);
+            return TwValue(TwValue::Array{
+                TwValue(ax * cc - ay * s), TwValue(ax * s + ay * cc)}); }},
 
         // ---- Vector math --------------------------------------------------
         // math/length — Euclidean length (hypot-style: inf beats NaN)
