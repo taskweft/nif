@@ -39,3 +39,4 @@ __pycache__/
 *.dets
 
 .elixir_ls/
+doc/
