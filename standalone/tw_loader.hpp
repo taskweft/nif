@@ -232,6 +232,94 @@ inline std::string node_type(const TwValue::Dict &expr) {
 
 using NodeFn = std::function<TwValue(TwValue, TwValue, TwValue, TwValue)>;
 
+// ---- Matrix helpers (floatNxN, flat row-major, N in {2,3,4}) ---------------
+// Generic NxN via Laplace expansion / adjugate — correct for any N and
+// simpler to get right than three hand-specialized 2x2/3x3/4x4 formulas.
+// Not performance-critical (interactivity graphs evaluate at authoring/tick
+// rate, not per-vertex).
+
+inline std::vector<double> mat_to_doubles(const TwValue &m) {
+    std::vector<double> out;
+    if (!m.is_array()) return out;
+    out.reserve(m.as_array().size());
+    for (const auto &v : m.as_array()) out.push_back(v.as_number());
+    return out;
+}
+
+// Row-major flat length -> matrix dimension; 0 if not a recognized floatNxN.
+inline int mat_dim(size_t n) {
+    if (n == 4) return 2;
+    if (n == 9) return 3;
+    if (n == 16) return 4;
+    return 0;
+}
+
+inline std::vector<double> mat_minor(const std::vector<double> &m, int n, int r, int c) {
+    std::vector<double> out; out.reserve((size_t)(n - 1) * (n - 1));
+    for (int i = 0; i < n; ++i) {
+        if (i == r) continue;
+        for (int j = 0; j < n; ++j) {
+            if (j == c) continue;
+            out.push_back(m[(size_t)i * n + j]);
+        }
+    }
+    return out;
+}
+
+inline double mat_det(const std::vector<double> &m, int n) {
+    if (n == 1) return m[0];
+    if (n == 2) return m[0] * m[3] - m[1] * m[2];
+    double det = 0.0;
+    for (int j = 0; j < n; ++j) {
+        double cof = ((j % 2 == 0) ? 1.0 : -1.0) * m[(size_t)j];
+        det += cof * mat_det(mat_minor(m, n, 0, j), n - 1);
+    }
+    return det;
+}
+
+inline std::vector<double> mat_transpose_v(const std::vector<double> &m, int n) {
+    std::vector<double> out((size_t)n * n);
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j)
+            out[(size_t)j * n + i] = m[(size_t)i * n + j];
+    return out;
+}
+
+inline std::vector<double> mat_mul_v(const std::vector<double> &a, const std::vector<double> &b, int n) {
+    std::vector<double> out((size_t)n * n, 0.0);
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j) {
+            double sum = 0.0;
+            for (int k = 0; k < n; ++k) sum += a[(size_t)i * n + k] * b[(size_t)k * n + j];
+            out[(size_t)i * n + j] = sum;
+        }
+    return out;
+}
+
+// Adjugate / determinant. Per spec: non-finite or zero determinant -> not
+// invertible, output matrix is all positive zeros.
+inline std::pair<bool, std::vector<double>> mat_inverse_v(const std::vector<double> &m, int n) {
+    double det = mat_det(m, n);
+    if (det == 0.0 || std::isnan(det) || std::isinf(det))
+        return {false, std::vector<double>((size_t)n * n, 0.0)};
+    std::vector<double> cof((size_t)n * n);
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j) {
+            double sign = ((i + j) % 2 == 0) ? 1.0 : -1.0;
+            cof[(size_t)i * n + j] = sign * mat_det(mat_minor(m, n, i, j), n - 1);
+        }
+    std::vector<double> adj = mat_transpose_v(cof, n);  // adjugate = transpose(cofactor)
+    std::vector<double> inv((size_t)n * n);
+    for (size_t i = 0; i < inv.size(); ++i) inv[i] = adj[i] / det;
+    return {true, inv};
+}
+
+inline TwValue mat_to_value(const std::vector<double> &m) {
+    TwValue::Array out; out.reserve(m.size());
+    for (double d : m) out.push_back(TwValue(d));
+    return TwValue(std::move(out));
+}
+
 inline const std::unordered_map<std::string, NodeFn> &kNodeTypes() {
     static const std::unordered_map<std::string, NodeFn> tbl = {
         // ---- Arithmetic (float/int polymorphic) ----------------------------
@@ -502,6 +590,146 @@ inline const std::unordered_map<std::string, NodeFn> &kNodeTypes() {
             else { double om=std::acos(d), so=std::sin(om); ka=std::sin((1.0-t)*om)/so; kb=std::sin(t*om)/so; }
             return TwValue(TwValue::Array{TwValue(ax*ka+bx*kb), TwValue(ay*ka+by*kb),
                                           TwValue(az*ka+bz*kb), TwValue(aw*ka+bw*kb)}); }},
+
+        // ---- Milestone 3: vector/matrix algebra ----------------------------
+        // math/rotate3D(a=float3, rotation=float4) — assumes unit quaternion.
+        // value = a + 2*(r x (r x a) + rw*(r x a))
+        {"rotate3D", [](auto a, auto rot, auto, auto) -> TwValue {
+            if (!a.is_array() || a.as_array().size() < 3 ||
+                !rot.is_array() || rot.as_array().size() < 4) return TwValue{};
+            double ax=a.as_array()[0].as_number(), ay=a.as_array()[1].as_number(), az=a.as_array()[2].as_number();
+            double rx=rot.as_array()[0].as_number(), ry=rot.as_array()[1].as_number(),
+                   rz=rot.as_array()[2].as_number(), rw=rot.as_array()[3].as_number();
+            double tx = ry*az - rz*ay, ty = rz*ax - rx*az, tz = rx*ay - ry*ax;
+            double ux = ry*tz - rz*ty, uy = rz*tx - rx*tz, uz = rx*ty - ry*tx;
+            return TwValue(TwValue::Array{
+                TwValue(ax + 2.0*(ux + rw*tx)),
+                TwValue(ay + 2.0*(uy + rw*ty)),
+                TwValue(az + 2.0*(uz + rw*tz))}); }},
+        // math/transform(a=floatN, b=floatNxN) — row-major matrix * vector.
+        {"transform", [](auto a, auto b, auto, auto) -> TwValue {
+            if (!a.is_array() || !b.is_array()) return TwValue{};
+            const auto &v = a.as_array();
+            auto m = mat_to_doubles(b);
+            int n = mat_dim(m.size());
+            if (n == 0 || (size_t)n != v.size()) return TwValue{};
+            TwValue::Array out; out.reserve((size_t)n);
+            for (int i = 0; i < n; ++i) {
+                double sum = 0.0;
+                for (int j = 0; j < n; ++j) sum += m[(size_t)i*n+j] * v[(size_t)j].as_number();
+                out.push_back(TwValue(sum));
+            }
+            return TwValue(std::move(out)); }},
+        // math/slerp(a=float2|float3, b=same, c=t) — vector slerp (distinct
+        // from math/quatSlerp above). Falls back to plain lerp near-zero
+        // length or near-parallel vectors, per spec §Vector Slerp.
+        {"slerp", [](auto a, auto b, auto c, auto) -> TwValue {
+            if (!a.is_array() || !b.is_array()) return TwValue{};
+            const auto &av = a.as_array(); const auto &bv = b.as_array();
+            size_t n = av.size();
+            if (n != bv.size() || (n != 2 && n != 3)) return TwValue{};
+            double t = c.as_number();
+            constexpr double kEps = 1e-8;
+            auto lerp_out = [&]() -> TwValue {
+                TwValue::Array out; out.reserve(n);
+                for (size_t i = 0; i < n; ++i)
+                    out.push_back(TwValue((1.0 - t)*av[i].as_number() + t*bv[i].as_number()));
+                return TwValue(std::move(out));
+            };
+            double la = 0.0, lb = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                la += av[i].as_number()*av[i].as_number();
+                lb += bv[i].as_number()*bv[i].as_number();
+            }
+            la = std::sqrt(la); lb = std::sqrt(lb);
+            if (la < kEps || lb < kEps) return lerp_out();
+            std::vector<double> ah(n), bh(n);
+            for (size_t i = 0; i < n; ++i) { ah[i] = av[i].as_number()/la; bh[i] = bv[i].as_number()/lb; }
+            double d = 0.0; for (size_t i = 0; i < n; ++i) d += ah[i]*bh[i];
+            d = std::clamp(d, -1.0, 1.0);
+            double L = (1.0 - t)*la + t*lb;
+            if (n == 2) {
+                double theta = std::acos(d);
+                if (ah[0]*bh[1] - ah[1]*bh[0] < 0.0) theta = -theta;
+                double ang = t * theta;
+                double s = std::sin(ang), cc = std::cos(ang);
+                return TwValue(TwValue::Array{
+                    TwValue((ah[0]*cc - ah[1]*s) * L),
+                    TwValue((ah[0]*s + ah[1]*cc) * L)});
+            }
+            // n == 3
+            if (d > 1.0 - kEps) return lerp_out();
+            double rx, ry, rz;
+            if (d < -1.0 + kEps) {
+                // Any unit vector perpendicular to ah.
+                if (std::abs(ah[0]) < 0.9) { rx = 1.0; ry = 0.0; rz = 0.0; }
+                else { rx = 0.0; ry = 1.0; rz = 0.0; }
+                double dp = rx*ah[0] + ry*ah[1] + rz*ah[2];
+                rx -= dp*ah[0]; ry -= dp*ah[1]; rz -= dp*ah[2];
+                double rl = std::sqrt(rx*rx+ry*ry+rz*rz);
+                rx/=rl; ry/=rl; rz/=rl;
+            } else {
+                rx = ah[1]*bh[2]-ah[2]*bh[1]; ry = ah[2]*bh[0]-ah[0]*bh[2]; rz = ah[0]*bh[1]-ah[1]*bh[0];
+                double rl = std::sqrt(rx*rx+ry*ry+rz*rz);
+                rx/=rl; ry/=rl; rz/=rl;
+            }
+            double ang = t * std::acos(d);
+            double qs = std::sin(0.5*ang), qw = std::cos(0.5*ang);
+            double qx = rx*qs, qy = ry*qs, qz = rz*qs;
+            // rotate3D(ah, Q)
+            double tx = qy*ah[2] - qz*ah[1], ty = qz*ah[0] - qx*ah[2], tz = qx*ah[1] - qy*ah[0];
+            double ux = qy*tz - qz*ty, uy = qz*tx - qx*tz, uz = qx*ty - qy*tx;
+            double ox = ah[0] + 2.0*(ux + qw*tx);
+            double oy = ah[1] + 2.0*(uy + qw*ty);
+            double oz = ah[2] + 2.0*(uz + qw*tz);
+            return TwValue(TwValue::Array{TwValue(ox*L), TwValue(oy*L), TwValue(oz*L)}); }},
+        // math/transpose(a=floatNxN)
+        {"transpose", [](auto a, auto, auto, auto) -> TwValue {
+            if (!a.is_array()) return TwValue{};
+            auto m = mat_to_doubles(a);
+            int n = mat_dim(m.size());
+            if (n == 0) return TwValue{};
+            return mat_to_value(mat_transpose_v(m, n)); }},
+        // math/determinant(a=floatNxN)
+        {"determinant", [](auto a, auto, auto, auto) -> TwValue {
+            if (!a.is_array()) return TwValue{};
+            auto m = mat_to_doubles(a);
+            int n = mat_dim(m.size());
+            if (n == 0) return TwValue{};
+            return TwValue(mat_det(m, n)); }},
+        // math/inverse(a=floatNxN, b=output selector) — b=0 (default) ->
+        // inverse matrix, b=1 -> isValid bool. Same b-as-selector convention
+        // extract2/3/4 already use for their index argument.
+        {"inverse", [](auto a, auto b, auto, auto) -> TwValue {
+            if (!a.is_array()) return TwValue{};
+            auto m = mat_to_doubles(a);
+            int n = mat_dim(m.size());
+            if (n == 0) return TwValue{};
+            auto [ok, inv] = mat_inverse_v(m, n);
+            if (b.as_int() == 1) return TwValue(ok);
+            return mat_to_value(inv); }},
+        // math/matMul(a=floatNxN, b=floatNxN, same N)
+        {"matMul", [](auto a, auto b, auto, auto) -> TwValue {
+            if (!a.is_array() || !b.is_array()) return TwValue{};
+            auto ma = mat_to_doubles(a), mb = mat_to_doubles(b);
+            int n = mat_dim(ma.size());
+            if (n == 0 || mb.size() != ma.size()) return TwValue{};
+            return mat_to_value(mat_mul_v(ma, mb, n)); }},
+        // math/matCompose(translation=float3 a, rotation=float4 b, scale=float3 c)
+        // -> float4x4 (row-major). Assumes unit rotation quaternion.
+        {"matCompose", [](auto a, auto b, auto c, auto) -> TwValue {
+            if (!a.is_array() || a.as_array().size() < 3 ||
+                !b.is_array() || b.as_array().size() < 4 ||
+                !c.is_array() || c.as_array().size() < 3) return TwValue{};
+            double tx=a.as_array()[0].as_number(), ty=a.as_array()[1].as_number(), tz=a.as_array()[2].as_number();
+            double rx=b.as_array()[0].as_number(), ry=b.as_array()[1].as_number(),
+                   rz=b.as_array()[2].as_number(), rw=b.as_array()[3].as_number();
+            double sx=c.as_array()[0].as_number(), sy=c.as_array()[1].as_number(), sz=c.as_array()[2].as_number();
+            return TwValue(TwValue::Array{
+                TwValue(sx*(1-2*(ry*ry+rz*rz))), TwValue(sy*2*(rx*ry-rz*rw)),     TwValue(sz*2*(rx*rz+ry*rw)),     TwValue(tx),
+                TwValue(sx*2*(rx*ry+rz*rw)),     TwValue(sy*(1-2*(rx*rx+rz*rz))), TwValue(sz*2*(ry*rz-rx*rw)),     TwValue(ty),
+                TwValue(sx*2*(rx*rz-ry*rw)),     TwValue(sy*2*(ry*rz+rx*rw)),     TwValue(sz*(1-2*(rx*rx+ry*ry))), TwValue(tz),
+                TwValue(0.0), TwValue(0.0), TwValue(0.0), TwValue(1.0)}); }},
     };
     return tbl;
 }
