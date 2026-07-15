@@ -1,5 +1,6 @@
 #include <fine.hpp>
 #include "tw_bridge.hpp"
+#include "tw_explain.hpp"
 #include "tw_json.hpp"
 #include "tw_loader.hpp"
 #include "tw_mc_executor.hpp"
@@ -161,6 +162,33 @@ std::string plan_with_temporal(ErlNifEnv *p_env, std::string p_domain_json,
 }
 FINE_NIF(plan_with_temporal, 0);
 
+// plan_with_temporal_explain(domain_json, origin_iso) → plan_with_temporal_json
+// Native explain mode for both solved plans and no_plan outcomes.
+std::string plan_with_temporal_explain(ErlNifEnv *p_env, std::string p_domain_json,
+		std::string p_origin_iso) {
+	TwLoader::TwLoaded loaded = load_cached(p_domain_json);
+	if (!loaded.state) {
+		throw std::runtime_error("failed_to_load_domain");
+	}
+
+	TwSolTree sol_tree;
+	std::optional<std::vector<TwCall>> result =
+		tw_plan_with_tree(loaded.state, loaded.tasks, loaded.domain, sol_tree);
+	if (!result) {
+		return tw_no_plan_explain_json(loaded.tasks, loaded.domain);
+	}
+
+	std::string plan_json = TwLoader::plan_to_json(*result);
+	TwTemporalResult tr = tw_check_temporal(*result, loaded.domain, p_origin_iso);
+	TwValue out = TwJson::parse_json_str(tw_temporal_to_json(*result, tr, plan_json));
+	if (out.is_dict()) {
+		out.as_dict()["status"] = TwValue("ok");
+		out.as_dict()["explain"] = tw_solution_tree_value(sol_tree, *result);
+	}
+	return TwJson::to_json(out);
+}
+FINE_NIF(plan_with_temporal_explain, 0);
+
 // check_temporal_civil(domain_json, plan_json, origin_iso, reference_date) → temporal_result_json
 // reference_date: "YYYY-MM-DD" — Y and Mo durations use actual calendar days.
 // Passes "" to fall back to Timex fixed-day conventions (same as check_temporal).
@@ -195,6 +223,34 @@ std::string plan_with_temporal_civil(ErlNifEnv *p_env, std::string p_domain_json
 	return tw_temporal_to_json(*result, tr, plan_json);
 }
 FINE_NIF(plan_with_temporal_civil, 0);
+
+// plan_with_temporal_civil_explain(domain_json, origin_iso, reference_date) → json
+// Native explain mode for both solved plans and no_plan outcomes.
+std::string plan_with_temporal_civil_explain(ErlNifEnv *p_env, std::string p_domain_json,
+		std::string p_origin_iso, std::string p_reference_date) {
+	TwLoader::TwLoaded loaded = load_cached(p_domain_json);
+	if (!loaded.state) {
+		throw std::runtime_error("failed_to_load_domain");
+	}
+
+	TwSolTree sol_tree;
+	std::optional<std::vector<TwCall>> result =
+		tw_plan_with_tree(loaded.state, loaded.tasks, loaded.domain, sol_tree);
+	if (!result) {
+		return tw_no_plan_explain_json(loaded.tasks, loaded.domain);
+	}
+
+	std::string plan_json = TwLoader::plan_to_json(*result);
+	TwTemporalResult tr = tw_check_temporal_civil(*result, loaded.domain,
+			p_origin_iso, p_reference_date);
+	TwValue out = TwJson::parse_json_str(tw_temporal_to_json(*result, tr, plan_json));
+	if (out.is_dict()) {
+		out.as_dict()["status"] = TwValue("ok");
+		out.as_dict()["explain"] = tw_solution_tree_value(sol_tree, *result);
+	}
+	return TwJson::to_json(out);
+}
+FINE_NIF(plan_with_temporal_civil_explain, 0);
 
 // domain_cache_clear() → :ok
 // Evicts all cached parsed domains. Call when domain JSON will not be reused.

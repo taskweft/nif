@@ -66,6 +66,16 @@ defmodule Taskweft do
     e -> {:error, Exception.message(e)}
   end
 
+  def plan_explain(domain_json, origin_iso \\ "PT0S", reference_date \\ "") do
+    if reference_date == "" do
+      {:ok, NIF.plan_with_temporal_explain(domain_json, origin_iso)}
+    else
+      {:ok, NIF.plan_with_temporal_civil_explain(domain_json, origin_iso, reference_date)}
+    end
+  rescue
+    e -> {:error, Exception.message(e)}
+  end
+
   def replan(domain_json, plan_json, fail_step \\ -1) do
     {:ok, NIF.replan(domain_json, plan_json, fail_step)}
   rescue
