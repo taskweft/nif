@@ -37,11 +37,29 @@ jobs:
           otp-version: '27'
           elixir-version: '1.17'
 
+      # Split into a cached install + a PATH-registration step: choco install
+      # itself is the slow part (~45s), and the mingw toolchain changes rarely
+      # enough that a static cache key is fine — bump the key if it ever needs
+      # to pick up a newer choco mingw package.
+      - name: Cache mingw-w64
+        if: matrix.toolchain == 'mingw'
+        id: cache-mingw
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\ProgramData\mingw64
+            C:\tools\mingw64
+          key: windows-2022-mingw-w64-v1
+
       - name: Install mingw-w64
+        if: matrix.toolchain == 'mingw' && steps.cache-mingw.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: choco install mingw --no-progress -y
+
+      - name: Add mingw-w64 to PATH
         if: matrix.toolchain == 'mingw'
         shell: pwsh
         run: |
-          choco install mingw --no-progress -y
           $mingwBin = (Get-ChildItem 'C:\ProgramData\mingw64', 'C:\tools\mingw64' -Filter 'mingw32-make.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1).Directory.FullName
           if (-not $mingwBin) { throw 'mingw32-make.exe not found after install' }
           Add-Content -Path $env:GITHUB_PATH -Value $mingwBin
