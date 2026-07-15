@@ -19,6 +19,7 @@ defmodule Taskweft.NIF.MixProject do
 
   defp package do
     [
+      organization: "chibifire",
       files: ~w(lib c_src standalone Makefile Makefile.win mix.exs README* LICENSE*),
       licenses: ["MIT"],
       links: %{"GitHub" => "https://github.com/taskweft/nif"}
