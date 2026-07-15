@@ -54,7 +54,6 @@ defmodule Taskweft do
   """
 
   alias Taskweft.NIF
-  alias Taskweft.ReBAC
 
   def plan(domain_json, origin_iso \\ "PT0S", reference_date \\ "") do
     if reference_date == "" do
@@ -93,11 +92,11 @@ defmodule Taskweft do
   end
 
   def rebac_check(graph_json, subj, expr_json, obj, fuel \\ 8) do
-    ReBAC.check(graph_json, subj, expr_json, obj, fuel)
+    NIF.rebac_check(graph_json, subj, expr_json, obj, fuel)
   end
 
   def rebac_expand(graph_json, rel, obj, fuel \\ 8) do
-    ReBAC.expand(graph_json, rel, obj, fuel)
+    NIF.rebac_expand(graph_json, rel, obj, fuel)
   end
 
   def bridge_extract_entities(state_json) do
