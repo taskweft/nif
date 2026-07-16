@@ -1168,9 +1168,7 @@ inline TwLoaded load_domain(const TwValue &data) {
     // exactly this reason (Crockford: comments got used to hold parsing
     // directives, which destroys interoperability) — a permitted-but-ignored
     // bucket inside the parsed document is the same hazard in a different
-    // shape. Human/LLM-facing documentation that isn't planner state lives
-    // in a sibling file the loader never reads, not inside the RECTGTN
-    // document itself.
+    // shape.
     static const std::unordered_set<std::string> kKnownKeys = {
         "@context", "@type", "name", "description", "version", "source",
         "enums", "variables", "actions", "methods", "goals", "todo_list",
