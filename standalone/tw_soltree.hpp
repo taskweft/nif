@@ -84,8 +84,8 @@ struct TwSolTree {
                     n.method_idx + 1 < (int)it->second.size())
                     return cur;
             } else if (n.kind == TwSolNode::Kind::Goal) {
-                auto it = domain.goal_methods.find(n.name);
-                if (it != domain.goal_methods.end() &&
+                auto it = domain.task_methods.find(n.name);
+                if (it != domain.task_methods.end() &&
                     n.method_idx + 1 < (int)it->second.size())
                     return cur;
             }

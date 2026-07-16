@@ -1022,10 +1022,9 @@ inline TwActionFn build_action(const TwValue::Dict &def, const TwValue::Dict &en
 // Also used to build goal-method alternatives: TwGoalMethodFn IS TwMethodFn
 // (tw_domain.hpp) — a goal method invoked as (state, [key, desired]) is the
 // same calling convention as an ordinary method whose params are
-// [key_param, desired_param], so there was never a real difference to keep
-// two copies of this function for (previously build_goal_method_alt, now
-// folded in here — goal methods dual-register under task_methods too, see
-// the "goals" map handling below).
+// [key_param, desired_param]. There's no distinct wire shape for a goal
+// method either: it's an ordinary "methods" entry named after the state
+// var it targets.
 inline TwMethodFn build_method_alt(const TwValue::Array &param_names,
         const TwValue::Dict &alt, const TwValue::Dict &enums) {
     auto get_arr = [&](const char *k) -> TwValue::Array {
@@ -1171,7 +1170,7 @@ inline TwLoaded load_domain(const TwValue &data) {
     // shape.
     static const std::unordered_set<std::string> kKnownKeys = {
         "@context", "@type", "name", "description", "version", "source",
-        "enums", "variables", "actions", "methods", "goals", "todo_list",
+        "enums", "variables", "actions", "methods", "todo_list",
         "capabilities",
     };
     for (const std::pair<const std::string, TwValue> &kv : d) {
@@ -1384,41 +1383,14 @@ inline TwLoaded load_domain(const TwValue &data) {
         }
     }
 
-    // Goal methods: domain-style "goals" is a dict of goal method definitions
-    // keyed by state var name. (The old problem-style array-form "goals" —
-    // a bare list of {pointer, eq} bindings — is gone; that shape now lives
-    // as a {"goal": [...]} item inside "todo_list", see below. It used to
-    // collide with this dict when a domain and a problem shared the "goals"
-    // key in one merged document; moving it into "todo_list" items removes
-    // that collision entirely.)
-    if (auto it = d.find("goals"); it != d.end() && it->second.is_dict()) {
-        for (auto &[goal_var, group] : it->second.as_dict()) {
-            if (!group.is_dict()) continue;
-            const auto &gd = group.as_dict();
-
-            TwValue::Array goal_params;
-            if (auto pit = gd.find("params"); pit != gd.end() && pit->second.is_array())
-                goal_params = pit->second.as_array();
-
-            auto alts_it = gd.find("alternatives");
-            if (alts_it == gd.end() || !alts_it->second.is_array()) continue;
-
-            std::vector<TwGoalMethodFn> fns;
-            for (auto &alt : alts_it->second.as_array()) {
-                if (!alt.is_dict()) continue;
-                fns.push_back(build_method_alt(goal_params, alt.as_dict(), enums));
-            }
-
-            // TwGoalMethodFn IS TwMethodFn (tw_domain.hpp) — a goal method
-            // invoked as (state, [key, desired]) is mechanically identical
-            // to an ordinary method call [goal_var, key, desired]. Register
-            // it under task_methods too so it's directly callable from an
-            // ordinary "todo_list" entry, not reachable only via a
-            // TwGoalBinding pushed from a {"goal": [...]} todo_list item.
-            result.domain.task_methods[goal_var] = fns;
-            result.domain.goal_methods[goal_var] = std::move(fns);
-        }
-    }
+    // There is no separate "goals" key: a goal method IS an ordinary method
+    // (TwGoalMethodFn is TwMethodFn) — TwGoal/TwMultiGoal binding resolution
+    // looks up task_methods by the target state var's name directly (see
+    // tw_planner.hpp), so a domain author defines a goal-satisfying method
+    // under "methods" like any other, named after the variable it targets.
+    // A separate top-level key here would just be a second, redundant way
+    // to write the exact same {params, alternatives} shape into the exact
+    // same map.
 
     // Initial todo list (GTPyHOP's term for this exact heterogeneous list —
     // find_plan(state, todo_list)). Array items are one of three shapes:
@@ -1532,11 +1504,10 @@ inline TwLoaded load_file_pair(const std::string &domain_path, const std::string
     // Merge state: problem values override domain defaults.
     for (auto &[k, v] : prob.state->vars)
         dom.state->vars[k] = v;
-    // Merge methods/goals: problem may define extra or override domain methods.
+    // Merge methods (goal methods included — no separate map): problem may
+    // define extra or override domain methods.
     for (auto &[k, v] : prob.domain.task_methods)
         dom.domain.task_methods[k] = v;
-    for (auto &[k, v] : prob.domain.goal_methods)
-        dom.domain.goal_methods[k] = v;
     for (auto &[k, v] : prob.domain.actions)
         dom.domain.actions[k] = v;
     if (!prob.tasks.empty())

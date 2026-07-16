@@ -86,12 +86,11 @@ inline TwValue tw_failure_task_value(const TwTask &task, const TwDomain &domain,
         d["name"] = TwValue(call->name);
         d["args"] = TwValue(call->args);
 
-        bool resolvable = domain.has_action(call->name) || domain.has_task(call->name) || domain.has_goal(call->name);
+        bool resolvable = domain.has_action(call->name) || domain.has_task(call->name);
         d["resolvable"] = TwValue(resolvable);
 
         if (domain.has_action(call->name)) d["symbol_type"] = TwValue("action");
         else if (domain.has_task(call->name)) d["symbol_type"] = TwValue("method");
-        else if (domain.has_goal(call->name)) d["symbol_type"] = TwValue("goal");
         else d["symbol_type"] = TwValue("unknown");
 
         return TwValue(std::move(d));

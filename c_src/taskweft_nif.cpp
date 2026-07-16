@@ -404,7 +404,7 @@ std::string witness_oracle(ErlNifEnv *p_env,
     // For TOHTN, witness = "the first goal method makes progress on the unsatisfied binding"
     auto candidate_is_witness = [&](uint64_t w) -> bool {
         // A failed domain parse (null state) has no witness — same outcome as
-        // a parse with no goal methods, handled by the check just below.
+        // a parse with no methods, handled by the check just below.
         if (!loaded.state) {
             return false;
         }
@@ -412,9 +412,10 @@ std::string witness_oracle(ErlNifEnv *p_env,
         auto state = loaded.state->copy();
         std::vector<TwValue> args = {TwValue(std::string("key")), TwValue(std::string("desired"))};
 
-        // Try decomposing with the witness goal method
-        auto git = loaded.domain.goal_methods.begin();
-        if (git == loaded.domain.goal_methods.end()) return false;
+        // Try decomposing with the witness method (goal methods have no
+        // separate map — they're ordinary task_methods entries)
+        auto git = loaded.domain.task_methods.begin();
+        if (git == loaded.domain.task_methods.end()) return false;
         if (git->second.empty()) return false;
 
         std::optional<std::vector<TwTask>> subs = git->second[0](state, args);
