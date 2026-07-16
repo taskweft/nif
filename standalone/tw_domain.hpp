@@ -103,18 +103,21 @@ using TwActionFn =
 using TwMethodFn =
     std::function<std::optional<std::vector<TwTask>>(std::shared_ptr<TwState>, std::vector<TwValue>)>;
 
-// Goal method: (state, args=[key, desired]) → subtask_list | nullopt.
-// Same signature as TwMethodFn — called with [key, desired] as args.
+// A goal method is called with args=[key, desired] to try to satisfy a
+// TwGoalBinding on the var it's registered under — mechanically identical
+// to an ordinary method call, just with that specific two-arg convention.
+// There is no separate storage for it: it's registered under task_methods
+// like any other method (by the state var name it targets), so TwGoal/
+// TwMultiGoal binding resolution looks it up there — see tw_planner.hpp's
+// unmet-binding dispatch.
 using TwGoalMethodFn = TwMethodFn;
 
 struct TwDomain {
     std::unordered_map<std::string, TwActionFn>              actions;
     std::unordered_map<std::string, std::vector<TwMethodFn>> task_methods;
-    std::unordered_map<std::string, std::vector<TwGoalMethodFn>> goal_methods;
     // ISO 8601 duration strings per action (RECTGTN 'T' temporal metadata).
     std::unordered_map<std::string, std::string>             action_durations;
 
     bool has_action(const std::string &n) const { return actions.count(n) > 0; }
     bool has_task(const std::string &n)   const { return task_methods.count(n) > 0; }
-    bool has_goal(const std::string &n)   const { return goal_methods.count(n) > 0; }
 };

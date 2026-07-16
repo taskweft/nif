@@ -183,7 +183,7 @@ inline bool tw_task_shallow_plausible(const TwTask &task,
         if (goal->is_satisfied(state)) return true;
         const std::vector<TwGoalBinding> unmet = goal->unsatisfied(state);
         for (const TwGoalBinding &b : unmet)
-            if (domain.goal_methods.count(b.var)) return true;
+            if (domain.task_methods.count(b.var)) return true;
         return false;
     }
 
@@ -192,7 +192,7 @@ inline bool tw_task_shallow_plausible(const TwTask &task,
     if (mg->is_satisfied(state)) return true;
     const std::vector<TwGoalBinding> unmet = mg->unsatisfied(state);
     for (const TwGoalBinding &b : unmet)
-        if (domain.goal_methods.count(b.var)) return true;
+        if (domain.task_methods.count(b.var)) return true;
     return false;
 }
 
@@ -267,8 +267,8 @@ inline TwWitnessResult tw_witness_oracle_goal_reach(
             const std::vector<TwGoalBinding> unmet = goal->unsatisfied(state);
             if (unmet.empty()) continue;
 
-            auto git = domain.goal_methods.find(unmet[0].var);
-            if (git != domain.goal_methods.end() && !git->second.empty()) {
+            auto git = domain.task_methods.find(unmet[0].var);
+            if (git != domain.task_methods.end() && !git->second.empty()) {
                 certified++;
                 continue;
             }
@@ -340,8 +340,8 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan(
         // Pick first unsatisfied binding; try all goal methods for its var.
         const TwGoalBinding &b = unmet[0];
         std::unordered_map<std::string, std::vector<TwGoalMethodFn>>::const_iterator git =
-            domain.goal_methods.find(b.var);
-        if (git == domain.goal_methods.end()) return mark_fail();
+            domain.task_methods.find(b.var);
+        if (git == domain.task_methods.end()) return mark_fail();
 
         std::vector<TwValue> goal_args = {TwValue(b.key), b.desired};
         TwCall gcall;
@@ -518,8 +518,8 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan_tree(
 
         const TwGoalBinding &b = unmet[0];
         std::unordered_map<std::string, std::vector<TwGoalMethodFn>>::const_iterator git =
-            domain.goal_methods.find(b.var);
-        if (git == domain.goal_methods.end()) return mark_fail();
+            domain.task_methods.find(b.var);
+        if (git == domain.task_methods.end()) return mark_fail();
 
         std::vector<TwValue> goal_args = {TwValue(b.key), b.desired};
         std::string gkey; // for method_skip lookup
