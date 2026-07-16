@@ -1163,11 +1163,18 @@ inline TwLoaded load_domain(const TwValue &data) {
     // key (e.g. the old "tasks" before the todo_list rename) used to be
     // silently ignored — no error, no effect, just quietly dropped data —
     // which is worse than a strict failure for a caller that mistyped or is
-    // still on an old shape.
+    // still on an old shape. No free-form "notes"/"metadata" catch-all key
+    // is whitelisted, deliberately: JSON itself dropped comment syntax for
+    // exactly this reason (Crockford: comments got used to hold parsing
+    // directives, which destroys interoperability) — a permitted-but-ignored
+    // bucket inside the parsed document is the same hazard in a different
+    // shape. Human/LLM-facing documentation that isn't planner state lives
+    // in a sibling file the loader never reads, not inside the RECTGTN
+    // document itself.
     static const std::unordered_set<std::string> kKnownKeys = {
         "@context", "@type", "name", "description", "version", "source",
         "enums", "variables", "actions", "methods", "goals", "todo_list",
-        "capabilities", "notes",
+        "capabilities",
     };
     for (const std::pair<const std::string, TwValue> &kv : d) {
         if (!kKnownKeys.count(kv.first)) {
