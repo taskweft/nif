@@ -48,7 +48,7 @@ make_problem = fn n ->
         ]
       }
     },
-    "tasks" => [["finish"]]
+    "todo_list" => [["finish"]]
   }
 end
 

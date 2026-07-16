@@ -9,7 +9,7 @@ end
 merge_domain_problem = fn domain, problem ->
   domain
   |> Map.put("variables", Map.get(problem, "variables", Map.get(domain, "variables", [])))
-  |> Map.put("tasks", Map.get(problem, "tasks", Map.get(domain, "tasks", [])))
+  |> Map.put("todo_list", Map.get(problem, "todo_list", Map.get(domain, "todo_list", [])))
   |> (fn m ->
     case Map.fetch(problem, "goals") do
       {:ok, goals} -> Map.put(m, "goals", goals)
