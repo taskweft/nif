@@ -71,4 +71,6 @@ defmodule Taskweft.NIF do
 
   def domain_cache_clear(), do: :erlang.nif_error(:not_loaded)
   def rebac_cache_clear(), do: :erlang.nif_error(:not_loaded)
+
+  def witness_oracle(_state_json, _tasks_json, _domain_json), do: :erlang.nif_error(:not_loaded)
 end
