@@ -13,8 +13,14 @@
 
 struct TwState {
     tsl::ordered_map<std::string, TwValue> vars;
-    // ReBAC graph for goal satisfaction via hasCapability (supports type inheritance).
-    TwReBAC::TwReBACGraph rebac_graph;
+    // ReBAC graph for goal satisfaction and action/method guards (hasCapability,
+    // team membership, delegation, ...). Immutable once built at domain-load
+    // time and shared (not deep-copied) across every state fork — a shared_ptr
+    // so `copy()` below can propagate it via ordinary default copy semantics
+    // instead of an explicit field-by-field allow-list that's easy to forget
+    // to update (a `TwReBACGraph` value member here previously was, silently,
+    // for every field added after `vars`).
+    std::shared_ptr<const TwReBAC::TwReBACGraph> rebac_graph;
     int rebac_fuel = 8;
 
     // Memoized canonical signature hash. Invalidated on any state mutation.
@@ -57,11 +63,17 @@ struct TwState {
         return it->second.as_dict().count(key.to_string()) > 0;
     }
 
-    // Deep copy — TwValue copy constructor handles nested data.
+    // Full member-wise copy (TwValue's copy constructor deep-copies `vars`;
+    // `rebac_graph` is a shared_ptr, so this is a cheap refcount bump, not a
+    // graph deep-copy). Deliberately *not* a field-by-field allow-list — the
+    // previous version only copied `vars`, silently dropping `rebac_graph`
+    // (and leaving every state after the first fork unable to satisfy a ReBAC
+    // goal binding) because nobody remembered to add the new field here.
+    // `sig_hash_valid`/`sig_hash_cache` copying along is correct too, not
+    // just harmless: the hash is still valid for an unmutated copy, and
+    // set_var/set_nested already invalidate it the moment the copy diverges.
     std::shared_ptr<TwState> copy() const {
-        auto c = std::make_shared<TwState>();
-        c->vars = vars;
-        return c;
+        return std::make_shared<TwState>(*this);
     }
 
     // Deterministic string fingerprint for cycle detection.
