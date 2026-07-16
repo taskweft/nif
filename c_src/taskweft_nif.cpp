@@ -35,7 +35,12 @@ static TwLoader::TwLoaded load_cached(const std::string &json) {
         auto it = s_domain_cache.find(json);
         if (it != s_domain_cache.end()) {
             TwLoader::TwLoaded result = it->second;
-            result.state = it->second.state->copy(); // fresh initial state
+            // A failed parse caches with a null state (see below) — every
+            // caller's `if (!loaded.state) throw ...` guard expects that null
+            // to survive the cache round-trip, not get dereferenced here.
+            if (result.state) {
+                result.state = it->second.state->copy(); // fresh initial state
+            }
             return result;
         }
     }
@@ -46,7 +51,9 @@ static TwLoader::TwLoaded load_cached(const std::string &json) {
         s_domain_cache.emplace(json, loaded);
     }
     TwLoader::TwLoaded result = loaded;
-    result.state = loaded.state->copy();
+    if (loaded.state) {
+        result.state = loaded.state->copy();
+    }
     return result;
 }
 
@@ -396,6 +403,11 @@ std::string witness_oracle(ErlNifEnv *p_env,
     // Candidate predicate: is a given "witness" index a valid witness?
     // For TOHTN, witness = "the first goal method makes progress on the unsatisfied binding"
     auto candidate_is_witness = [&](uint64_t w) -> bool {
+        // A failed domain parse (null state) has no witness — same outcome as
+        // a parse with no goal methods, handled by the check just below.
+        if (!loaded.state) {
+            return false;
+        }
         // Fresh copy of the initial state for each candidate check
         auto state = loaded.state->copy();
         std::vector<TwValue> args = {TwValue(std::string("key")), TwValue(std::string("desired"))};
