@@ -1147,8 +1147,16 @@ struct TwLoaded {
 
 inline TwLoaded load_domain(const TwValue &data) {
     TwLoaded result;
+    // A non-object top-level document (array, string, number, null) used to
+    // fall through with `state` already allocated, so every downstream
+    // caller's `if (!loaded.state) throw "failed_to_load_domain"` guard
+    // never fired — a malformed document silently planned as an empty
+    // domain (trivial "ok" success) instead of failing to load. `state`
+    // stays null here specifically so that guard catches this case too.
+    if (!data.is_dict()) {
+        return result;
+    }
     result.state = std::make_shared<TwState>();
-    if (!data.is_dict()) return result;
     const auto &d = data.as_dict();
 
     // Enums
@@ -1394,6 +1402,10 @@ inline TwLoaded load_domain(const TwValue &data) {
     //   [name, args...]                        — TwCall
     //   {"multigoal": {var: {key: desired}}}    — TwMultiGoal
     //   {"goal": [{"pointer", "eq"}, ...]}      — TwGoal (conjunctive bindings)
+    // Any other item shape (an empty call array, an object matching none of
+    // the three, a bare scalar) fails the whole load instead of silently
+    // vanishing from the plan — a malformed item is caller error, not an
+    // empty-but-valid todo list entry.
     if (auto it = d.find("todo_list"); it != d.end() && it->second.is_array()) {
         for (const TwValue &task_def : it->second.as_array()) {
             if (task_def.is_dict()) {
@@ -1403,7 +1415,9 @@ inline TwLoaded load_domain(const TwValue &data) {
                     // {"multigoal": {var: {key: desired, ...}, ...}}
                     TwMultiGoal mg;
                     for (const std::pair<const std::string, TwValue> &vp : mg_it->second.as_dict()) {
-                        if (!vp.second.is_dict()) continue;
+                        if (!vp.second.is_dict()) {
+                            continue;
+                        }
                         for (const std::pair<const std::string, TwValue> &kp : vp.second.as_dict()) {
                             TwGoalBinding b;
                             b.var     = vp.first;
@@ -1412,33 +1426,58 @@ inline TwLoaded load_domain(const TwValue &data) {
                             mg.bindings.push_back(std::move(b));
                         }
                     }
-                    if (!mg.bindings.empty()) result.tasks.push_back(std::move(mg));
+                    if (mg.bindings.empty()) {
+                        result.state = nullptr;
+                        return result;
+                    }
+                    result.tasks.push_back(std::move(mg));
                 } else if (auto g_it = td.find("goal"); g_it != td.end() && g_it->second.is_array()) {
                     // {"goal": [{"pointer": "/var/key", "eq": desired}, ...]}
                     TwGoal goal;
                     for (auto &entry : g_it->second.as_array()) {
-                        if (!entry.is_dict()) continue;
+                        if (!entry.is_dict()) {
+                            continue;
+                        }
                         const auto &ed = entry.as_dict();
                         auto ptr_it = ed.find("pointer");
                         auto eq_it  = ed.find("eq");
-                        if (ptr_it == ed.end() || eq_it == ed.end()) continue;
+                        if (ptr_it == ed.end() || eq_it == ed.end()) {
+                            continue;
+                        }
                         Params empty_params;
                         auto [var, key] = parse_pointer(ptr_it->second.as_string(), empty_params);
-                        if (var.empty()) continue;
+                        if (var.empty()) {
+                            continue;
+                        }
                         TwGoalBinding b;
                         b.var     = var;
                         b.key     = key.to_string();
                         b.desired = eq_it->second;
                         goal.bindings.push_back(std::move(b));
                     }
-                    if (!goal.bindings.empty()) result.tasks.push_back(std::move(goal));
+                    if (goal.bindings.empty()) {
+                        result.state = nullptr;
+                        return result;
+                    }
+                    result.tasks.push_back(std::move(goal));
+                } else {
+                    // Neither "multigoal" nor "goal" — an unrecognized object shape.
+                    result.state = nullptr;
+                    return result;
                 }
             } else if (task_def.is_array() && !task_def.as_array().empty()) {
                 const TwValue::Array &arr = task_def.as_array();
                 TwCall call;
                 call.name = arr[0].as_string();
-                for (size_t i = 1; i < arr.size(); ++i) call.args.push_back(arr[i]);
+                for (size_t i = 1; i < arr.size(); ++i) {
+                    call.args.push_back(arr[i]);
+                }
                 result.tasks.push_back(std::move(call));
+            } else {
+                // An empty call array or a bare scalar — not any of the three
+                // task kinds.
+                result.state = nullptr;
+                return result;
             }
         }
     }
