@@ -19,7 +19,7 @@ struct TwCall {
 // Maps to IPyHOP unigoal ('var', 'key', desired_val).
 //
 // Satisfaction strategy (in priority order):
-//  1. ReBAC check — if state.rebac_graph is non-empty:
+//  1. ReBAC check — if state.rebac_graph is set and non-empty:
 //     • var is a JSON object  → parsed as a full RelationExpr (union, intersection,
 //       difference, tuple_to_userset, …) and evaluated via check_expr.
 //     • var is a plain string → auto-wrapped as {"type":"base","rel":var}
@@ -32,7 +32,7 @@ struct TwGoalBinding {
     TwValue     desired;
 
     bool satisfied(const TwState &state) const {
-        if (!state.rebac_graph.edges.empty()) {
+        if ((state.rebac_graph) && (!state.rebac_graph->edges.empty())) {
             TwValue expr;
             if (!var.empty() && var.front() == '{') {
                 expr = TwJson::parse_json_str(var);
@@ -44,7 +44,7 @@ struct TwGoalBinding {
                 m["rel"]  = TwValue(var);
                 expr = TwValue(std::move(m));
             }
-            return TwReBAC::check_expr(state.rebac_graph, key, expr,
+            return TwReBAC::check_expr(*state.rebac_graph, key, expr,
                                        desired.as_string(), state.rebac_fuel);
         }
         return state.get_nested(var, TwValue(key)) == desired;

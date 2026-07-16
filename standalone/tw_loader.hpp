@@ -763,6 +763,36 @@ inline TwValue eval_node(const TwValue::Dict &expr, const Params &params,
         return var.empty() ? TwValue{} : state.get_nested(var, key);
     }
 
+    // rebac/check: {"type":"rebac/check","rel":<string-or-relation-expr>,
+    //               "subject":<eval-expr>,"object":<eval-expr>}
+    // "rel" is not itself evaluated — it's a relation-expression tree (or a
+    // bare capability-name string, sugar for {"type":"base","rel":<string>})
+    // consumed directly by TwReBAC::check_expr against the domain's graph
+    // (TwState::rebac_graph, populated once at load time — see
+    // tw_loader.hpp's `load_domain`). "subject"/"object" are ordinary
+    // sub-expressions (typically a "{param}" string, resolved the same way
+    // any other action/method param reference is), so this composes with
+    // whatever the rest of the eval language already supports rather than
+    // inventing a second templating mechanism. The action-guard mechanism
+    // this replaces (a bespoke TwActionFn-wrapping closure) is gone —
+    // capabilities.actions requirements now compile into an ordinary
+    // {"eval": {"type": "rebac/check", ...}} body step, ANDed with whatever
+    // other guards/effects an action already has.
+    if ((type == "check") && (expr.count("rel"))) {
+        if (!state.rebac_graph) return TwValue(false);
+        TwValue rel_expr = expr.at("rel");
+        if (rel_expr.is_string()) {
+            TwValue::Dict base_expr;
+            base_expr["type"] = TwValue(std::string("base"));
+            base_expr["rel"]  = rel_expr;
+            rel_expr = TwValue(std::move(base_expr));
+        }
+        std::string subject = get("subject").as_string();
+        std::string object  = get("object").as_string();
+        return TwValue(TwReBAC::check_expr(*state.rebac_graph, subject, rel_expr,
+                object, state.rebac_fuel));
+    }
+
     // math/combine3x3 — pack 9 named floats (row-major) into a 3x3 matrix.
     // Structural: needs >4 named inputs, beyond the (a,b,c,d) table convention.
     if (type == "combine3x3") {
@@ -1246,37 +1276,64 @@ inline TwLoaded load_domain(const TwValue &data) {
         }
     }
 
-    // Actions — build fns, then wrap with capability guards if needed
+    // Assign the domain's ReBAC graph onto the initial state once — the
+    // single source of truth both goal-binding satisfaction
+    // (TwGoalBinding::satisfied, tw_domain.hpp) and the rebac/check eval
+    // node below read from. TwState::copy() propagates it via ordinary
+    // default member-wise copy (cheap: it's a shared_ptr), so it stays
+    // available at every state reached during planning, not just the
+    // initial one.
+    result.state->rebac_graph = rebac_graph;
+
+    // Actions — a capability requirement compiles into an ordinary
+    // {"eval": {"type": "rebac/check", ...}} guard step prepended to the
+    // action's own body, reusing the exact mechanism every action already
+    // has for any other precondition (build_action's "eval" step handling
+    // below) instead of a bespoke TwActionFn-wrapping closure. The flat/
+    // graph capabilities.actions wire shape (parsed above into
+    // `action_required`) is unchanged — only how it's *compiled* changes.
     if (auto it = d.find("actions"); it != d.end() && it->second.is_dict()) {
         for (const std::pair<const std::string, TwValue> &np : it->second.as_dict()) {
             if (!np.second.is_dict()) continue;
             // RECTGTN 'T': store ISO 8601 duration metadata for temporal analysis.
-            const TwValue::Dict &adef = np.second.as_dict();
+            TwValue::Dict adef = np.second.as_dict();
             TwValue::Dict::const_iterator dur_it = adef.find("duration");
             if (dur_it != adef.end() && dur_it->second.is_string())
                 result.domain.action_durations[np.first] = dur_it->second.as_string();
-            TwActionFn fn = build_action(adef, enums);
 
             std::unordered_map<std::string, std::vector<std::pair<TwValue, std::string>>>::const_iterator rc_it =
                 action_required.find(np.first);
-            if (rc_it != action_required.end() && !rc_it->second.empty()) {
-                // Wrap: first arg is agent; every (relation-expression, object)
-                // requirement must hold against the domain's ReBAC graph.
-                std::vector<std::pair<TwValue, std::string>> reqs = rc_it->second;
-                std::shared_ptr<TwReBAC::TwReBACGraph> graph = rebac_graph;
-                TwActionFn orig = std::move(fn);
-                fn = [orig, reqs, graph](std::shared_ptr<TwState> state, std::vector<TwValue> args)
-                        -> std::shared_ptr<TwState> {
-                    if (args.empty()) return nullptr;
-                    const std::string &agent = args[0].as_string();
-                    for (const std::pair<TwValue, std::string> &req : reqs)
-                        if (!TwReBAC::check_expr(*graph, agent, req.first, req.second, 8))
-                            return nullptr;
-                    return orig(state, args);
-                };
+            if ((rc_it != action_required.end()) && (!rc_it->second.empty())) {
+                TwValue::Array param_names;
+                if (auto pit = adef.find("params"); pit != adef.end() && pit->second.is_array())
+                    param_names = pit->second.as_array();
+                // Capability guards require the actor to be the action's
+                // first param, by convention (validated Elixir-side via the
+                // capability_actor_param_not_first_agent diagnostic).
+                std::string agent_ref = (param_names.empty())
+                        ? std::string() : ("{" + param_names[0].as_string() + "}");
+
+                TwValue::Array guard_steps;
+                for (const std::pair<TwValue, std::string> &req : rc_it->second) {
+                    TwValue::Dict node;
+                    node["type"]    = TwValue(std::string("rebac/check"));
+                    node["rel"]     = req.first;
+                    node["subject"] = TwValue(agent_ref);
+                    node["object"]  = TwValue(req.second);
+                    TwValue::Dict step;
+                    step["eval"] = TwValue(std::move(node));
+                    guard_steps.push_back(TwValue(std::move(step)));
+                }
+
+                TwValue::Array body;
+                if (auto bit = adef.find("body"); bit != adef.end() && bit->second.is_array())
+                    body = bit->second.as_array();
+                guard_steps.insert(guard_steps.end(),
+                        std::make_move_iterator(body.begin()), std::make_move_iterator(body.end()));
+                adef["body"] = TwValue(std::move(guard_steps));
             }
 
-            result.domain.actions[np.first] = std::move(fn);
+            result.domain.actions[np.first] = build_action(adef, enums);
         }
     }
 
