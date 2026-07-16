@@ -1171,6 +1171,7 @@ inline TwLoaded load_domain(const TwValue &data) {
     static const std::unordered_set<std::string> kKnownKeys = {
         "@context", "@type", "name", "description", "version", "source",
         "enums", "variables", "actions", "methods", "todo_list",
+        "capabilities",
     };
     for (const std::pair<const std::string, TwValue> &kv : d) {
         if (!kKnownKeys.count(kv.first)) {
@@ -1185,14 +1186,7 @@ inline TwLoaded load_domain(const TwValue &data) {
         result.enums = it->second.as_dict();
     const auto &enums = result.enums;
 
-    // Variables. A variable literally named "capabilities" is ordinary state
-    // like any other — it's pointer-addressable the same way — but is also
-    // read below to build the domain's ReBAC graph, the one piece of load-
-    // time compilation a plain state variable can't do for itself: entity/
-    // relationship edges want a real graph structure (adjacency + expand
-    // index) for TwReBAC::check_expr's relation-expression algebra
-    // (union/intersection/tuple_to_userset chains), not a pointer walk.
-    TwValue capabilities_init;
+    // Variables
     if (auto it = d.find("variables"); it != d.end() && it->second.is_array()) {
         for (auto &var_def : it->second.as_array()) {
             if (!var_def.is_dict()) continue;
@@ -1205,32 +1199,36 @@ inline TwLoaded load_domain(const TwValue &data) {
             if (init.is_dict()) {
                 for (auto &[key, val] : init.as_dict())
                     result.state->set_nested(var_name, TwValue(key), val);
-                if (var_name == "capabilities") capabilities_init = init;
             } else {
                 result.state->set_var(var_name, init);
             }
         }
     }
 
-    // Relationships (ADR 0004): the "capabilities" variable's "entities" list
-    // compiles into HAS_CAPABILITY edges on a TwReBAC::TwReBACGraph (the same
-    // graph engine Taskweft.ReBAC uses standalone), plus an optional explicit
-    // "graph" key (identical wire format to Taskweft.ReBAC's graph_json:
-    // {"edges":[...],"definitions":{}}) for richer relationships (team
-    // membership, delegation, ...). _cap_<cap> state vars are still populated
-    // for introspection/backward compatibility, but action guards are
-    // evaluated against the graph via TwReBAC::check_expr, not read back from
-    // those vars — so a domain can express a capability requirement as an
+    // Relationships (ADR 0004): a top-level "capabilities" object — a
+    // dedicated key, not a variable, matching glTF Interactivity's own
+    // convention that structured/relational extension data (e.g.
+    // KHR_lights_punctual's "/extensions/KHR_lights_punctual/lights") gets
+    // its own namespaced slot rather than sharing the generic scalar/vector
+    // "variables" array. Its "entities" list compiles into HAS_CAPABILITY
+    // edges on a TwReBAC::TwReBACGraph (the same graph engine Taskweft.ReBAC
+    // uses standalone), plus an optional explicit "graph" key (identical
+    // wire format to Taskweft.ReBAC's graph_json: {"edges":[...],
+    // "definitions":{}}) for richer relationships (team membership,
+    // delegation, ...). _cap_<cap> state vars are still populated for
+    // introspection/backward compatibility, but action guards are evaluated
+    // against the graph via TwReBAC::check_expr, not read back from those
+    // vars — so a domain can express a capability requirement as an
     // arbitrary relation expression, not just a direct HAS_CAPABILITY edge.
     //
-    // There is no compiled sugar for action requirements anymore: a domain
-    // author writes the {"eval": {"type": "rebac/check", ...}} guard step
-    // directly into the action's own body, the same mechanism every other
-    // action precondition already uses (build_action's "eval" step handling,
+    // There is no compiled sugar for action requirements: a domain author
+    // writes the {"eval": {"type": "rebac/check", ...}} guard step directly
+    // into the action's own body, the same mechanism every other action
+    // precondition already uses (build_action's "eval" step handling,
     // below — "action fails if the result is false").
     auto rebac_graph = std::make_shared<TwReBAC::TwReBACGraph>();
-    if (capabilities_init.is_dict()) {
-        const TwValue::Dict &caps = capabilities_init.as_dict();
+    if (auto cap_it = d.find("capabilities"); cap_it != d.end() && cap_it->second.is_dict()) {
+        const TwValue::Dict &caps = cap_it->second.as_dict();
 
         // entities: {entity: [cap, ...]} → HAS_CAPABILITY edge + _cap_<cap>[entity] (compat)
         TwValue::Dict::const_iterator ent_it = caps.find("entities");
