@@ -1018,6 +1018,13 @@ inline TwActionFn build_action(const TwValue::Dict &def, const TwValue::Dict &en
     };
 }
 
+// Also used to build goal-method alternatives: TwGoalMethodFn IS TwMethodFn
+// (tw_domain.hpp) — a goal method invoked as (state, [key, desired]) is the
+// same calling convention as an ordinary method whose params are
+// [key_param, desired_param], so there was never a real difference to keep
+// two copies of this function for (previously build_goal_method_alt, now
+// folded in here — goal methods dual-register under task_methods too, see
+// the "goals" map handling below).
 inline TwMethodFn build_method_alt(const TwValue::Array &param_names,
         const TwValue::Dict &alt, const TwValue::Dict &enums) {
     auto get_arr = [&](const char *k) -> TwValue::Array {
@@ -1032,27 +1039,6 @@ inline TwMethodFn build_method_alt(const TwValue::Array &param_names,
             std::shared_ptr<TwState> state, std::vector<TwValue> args)
             -> std::optional<std::vector<TwTask>> {
         Params params = build_params(param_names, args);
-        run_binds(bind_defs, params, *state);
-        if (!run_checks(check_defs, params, *state, enums)) return std::nullopt;
-        return expand_subtasks(subtask_defs, params);
-    };
-}
-
-inline TwGoalMethodFn build_goal_method_alt(const TwValue::Array &goal_param_names,
-        const TwValue::Dict &alt, const TwValue::Dict &enums) {
-    auto get_arr = [&](const char *k) -> TwValue::Array {
-        auto it = alt.find(k);
-        return (it != alt.end() && it->second.is_array()) ? it->second.as_array() : TwValue::Array{};
-    };
-    TwValue::Array bind_defs    = get_arr("bind");
-    TwValue::Array check_defs   = get_arr("check");
-    TwValue::Array subtask_defs = get_arr("subtasks");
-
-    // goal_param_names are e.g. ["block", "dest"]; args=[key, desired].
-    return [goal_param_names, bind_defs, check_defs, subtask_defs, enums](
-            std::shared_ptr<TwState> state, std::vector<TwValue> args)
-            -> std::optional<std::vector<TwTask>> {
-        Params params = build_params(goal_param_names, args);
         run_binds(bind_defs, params, *state);
         if (!run_checks(check_defs, params, *state, enums)) return std::nullopt;
         return expand_subtasks(subtask_defs, params);
@@ -1385,7 +1371,7 @@ inline TwLoaded load_domain(const TwValue &data) {
                 std::vector<TwGoalMethodFn> fns;
                 for (auto &alt : alts_it->second.as_array()) {
                     if (!alt.is_dict()) continue;
-                    fns.push_back(build_goal_method_alt(goal_params, alt.as_dict(), enums));
+                    fns.push_back(build_method_alt(goal_params, alt.as_dict(), enums));
                 }
 
                 // TwGoalMethodFn IS TwMethodFn (tw_domain.hpp) — a goal method
