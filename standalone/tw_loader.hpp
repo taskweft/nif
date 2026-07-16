@@ -1353,87 +1353,86 @@ inline TwLoaded load_domain(const TwValue &data) {
         }
     }
 
-    // Goal methods (domain: "goals" is a dict) or goal bindings (problem: "goals" is an array).
-    if (auto it = d.find("goals"); it != d.end()) {
-        if (it->second.is_dict()) {
-            // Domain-style: dict of goal method definitions keyed by state var name.
-            for (auto &[goal_var, group] : it->second.as_dict()) {
-                if (!group.is_dict()) continue;
-                const auto &gd = group.as_dict();
+    // Goal methods: domain-style "goals" is a dict of goal method definitions
+    // keyed by state var name. (The old problem-style array-form "goals" —
+    // a bare list of {pointer, eq} bindings — is gone; that shape now lives
+    // as a {"goal": [...]} item inside "todo_list", see below. It used to
+    // collide with this dict when a domain and a problem shared the "goals"
+    // key in one merged document; moving it into "todo_list" items removes
+    // that collision entirely.)
+    if (auto it = d.find("goals"); it != d.end() && it->second.is_dict()) {
+        for (auto &[goal_var, group] : it->second.as_dict()) {
+            if (!group.is_dict()) continue;
+            const auto &gd = group.as_dict();
 
-                TwValue::Array goal_params;
-                if (auto pit = gd.find("params"); pit != gd.end() && pit->second.is_array())
-                    goal_params = pit->second.as_array();
+            TwValue::Array goal_params;
+            if (auto pit = gd.find("params"); pit != gd.end() && pit->second.is_array())
+                goal_params = pit->second.as_array();
 
-                auto alts_it = gd.find("alternatives");
-                if (alts_it == gd.end() || !alts_it->second.is_array()) continue;
+            auto alts_it = gd.find("alternatives");
+            if (alts_it == gd.end() || !alts_it->second.is_array()) continue;
 
-                std::vector<TwGoalMethodFn> fns;
-                for (auto &alt : alts_it->second.as_array()) {
-                    if (!alt.is_dict()) continue;
-                    fns.push_back(build_method_alt(goal_params, alt.as_dict(), enums));
-                }
-
-                // TwGoalMethodFn IS TwMethodFn (tw_domain.hpp) — a goal method
-                // invoked as (state, [key, desired]) is mechanically identical
-                // to an ordinary method call [goal_var, key, desired]. Register
-                // it under task_methods too so it's directly callable from an
-                // ordinary "tasks" entry, not reachable only via a TwGoalBinding
-                // pushed from a top-level array-form "goals". This is what lets
-                // a problem express its target as ["pos", "a", "table"] in its
-                // own "tasks" list — merged the same well-tested way any other
-                // task is (Taskweft.CLI's merge_tasks) — instead of needing the
-                // separate top-level "goals" key, which collides: a domain's
-                // "goals" (this map, defining methods) and a problem's "goals"
-                // (an array of desired bindings) can't coexist in one merged
-                // document since they're the same JSON key. The array form
-                // still works standalone (TwGoalBinding, below) for a document
-                // that doesn't need to merge with a separate problem file.
-                result.domain.task_methods[goal_var] = fns;
-                result.domain.goal_methods[goal_var] = std::move(fns);
+            std::vector<TwGoalMethodFn> fns;
+            for (auto &alt : alts_it->second.as_array()) {
+                if (!alt.is_dict()) continue;
+                fns.push_back(build_method_alt(goal_params, alt.as_dict(), enums));
             }
-        } else if (it->second.is_array()) {
-            // Problem-style: array of {pointer, eq} bindings → single TwGoal task.
-            TwGoal goal;
-            for (auto &entry : it->second.as_array()) {
-                if (!entry.is_dict()) continue;
-                const auto &ed = entry.as_dict();
-                auto ptr_it = ed.find("pointer");
-                auto eq_it  = ed.find("eq");
-                if (ptr_it == ed.end() || eq_it == ed.end()) continue;
-                Params empty_params;
-                auto [var, key] = parse_pointer(ptr_it->second.as_string(), empty_params);
-                if (var.empty()) continue;
-                TwGoalBinding b;
-                b.var     = var;
-                b.key     = key.to_string();
-                b.desired = eq_it->second;
-                goal.bindings.push_back(std::move(b));
-            }
-            if (!goal.bindings.empty())
-                result.tasks.push_back(std::move(goal));
+
+            // TwGoalMethodFn IS TwMethodFn (tw_domain.hpp) — a goal method
+            // invoked as (state, [key, desired]) is mechanically identical
+            // to an ordinary method call [goal_var, key, desired]. Register
+            // it under task_methods too so it's directly callable from an
+            // ordinary "todo_list" entry, not reachable only via a
+            // TwGoalBinding pushed from a {"goal": [...]} todo_list item.
+            result.domain.task_methods[goal_var] = fns;
+            result.domain.goal_methods[goal_var] = std::move(fns);
         }
     }
 
-    // Initial task list — array items are either [name, args...] calls or {"multigoal": {...}} objects.
-    if (auto it = d.find("tasks"); it != d.end() && it->second.is_array()) {
+    // Initial todo list (GTPyHOP's term for this exact heterogeneous list —
+    // find_plan(state, todo_list)). Array items are one of three shapes:
+    //   [name, args...]                        — TwCall
+    //   {"multigoal": {var: {key: desired}}}    — TwMultiGoal
+    //   {"goal": [{"pointer", "eq"}, ...]}      — TwGoal (conjunctive bindings)
+    if (auto it = d.find("todo_list"); it != d.end() && it->second.is_array()) {
         for (const TwValue &task_def : it->second.as_array()) {
             if (task_def.is_dict()) {
-                // {"multigoal": {var: {key: desired, ...}, ...}}
-                TwValue::Dict::const_iterator mg_it = task_def.as_dict().find("multigoal");
-                if (mg_it == task_def.as_dict().end() || !mg_it->second.is_dict()) continue;
-                TwMultiGoal mg;
-                for (const std::pair<const std::string, TwValue> &vp : mg_it->second.as_dict()) {
-                    if (!vp.second.is_dict()) continue;
-                    for (const std::pair<const std::string, TwValue> &kp : vp.second.as_dict()) {
-                        TwGoalBinding b;
-                        b.var     = vp.first;
-                        b.key     = kp.first;
-                        b.desired = kp.second;
-                        mg.bindings.push_back(std::move(b));
+                const TwValue::Dict &td = task_def.as_dict();
+
+                if (auto mg_it = td.find("multigoal"); mg_it != td.end() && mg_it->second.is_dict()) {
+                    // {"multigoal": {var: {key: desired, ...}, ...}}
+                    TwMultiGoal mg;
+                    for (const std::pair<const std::string, TwValue> &vp : mg_it->second.as_dict()) {
+                        if (!vp.second.is_dict()) continue;
+                        for (const std::pair<const std::string, TwValue> &kp : vp.second.as_dict()) {
+                            TwGoalBinding b;
+                            b.var     = vp.first;
+                            b.key     = kp.first;
+                            b.desired = kp.second;
+                            mg.bindings.push_back(std::move(b));
+                        }
                     }
+                    if (!mg.bindings.empty()) result.tasks.push_back(std::move(mg));
+                } else if (auto g_it = td.find("goal"); g_it != td.end() && g_it->second.is_array()) {
+                    // {"goal": [{"pointer": "/var/key", "eq": desired}, ...]}
+                    TwGoal goal;
+                    for (auto &entry : g_it->second.as_array()) {
+                        if (!entry.is_dict()) continue;
+                        const auto &ed = entry.as_dict();
+                        auto ptr_it = ed.find("pointer");
+                        auto eq_it  = ed.find("eq");
+                        if (ptr_it == ed.end() || eq_it == ed.end()) continue;
+                        Params empty_params;
+                        auto [var, key] = parse_pointer(ptr_it->second.as_string(), empty_params);
+                        if (var.empty()) continue;
+                        TwGoalBinding b;
+                        b.var     = var;
+                        b.key     = key.to_string();
+                        b.desired = eq_it->second;
+                        goal.bindings.push_back(std::move(b));
+                    }
+                    if (!goal.bindings.empty()) result.tasks.push_back(std::move(goal));
                 }
-                if (!mg.bindings.empty()) result.tasks.push_back(std::move(mg));
             } else if (task_def.is_array() && !task_def.as_array().empty()) {
                 const TwValue::Array &arr = task_def.as_array();
                 TwCall call;

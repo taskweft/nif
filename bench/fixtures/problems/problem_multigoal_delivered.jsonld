@@ -34,7 +34,7 @@
       }
     }
   ],
-  "tasks": [
+  "todo_list": [
     {
       "multigoal": {
         "delivered": {
