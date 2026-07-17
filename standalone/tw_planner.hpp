@@ -12,7 +12,27 @@
 #include <unordered_set>
 #include <vector>
 
-static constexpr int TW_MAX_DEPTH = 256;
+// Bounds branching-search recursion depth only, not sequence length (see
+// tw_seek_plan's fast-path loop, which advances through primitive actions
+// and satisfied goals without recursing or spending fuel at all). Genuine
+// branching (an unmet goal/multigoal, or a compound task via methods)
+// still recurses for real, one C++ stack frame per branch attempted, and
+// isn't (yet) tail-call-eligible -- confirmed via an actual debug build:
+// a flat sequence of ~500 independent compound-task calls (each resolving
+// via exactly one method, no real backtracking) stayed safe, ~1000
+// segfaulted. 400 leaves real margin below that empirically-observed
+// crash zone on the most constrained platform tested (Windows/mingw;
+// Linux's typically larger default thread stack likely tolerates more,
+// but production correctness shouldn't depend on that assumption).
+// TW_DEFAULT_BUDGET (wall-clock) is still the primary, real guard per its
+// own doc comment -- this is deliberately not a second meaningful limit,
+// just a hard floor under it so a domain wide enough to need more than
+// ~400 sequential branching decisions fails cleanly (no_plan) rather than
+// crashing the whole BEAM VM. Widening this further needs restructuring
+// compound-task dispatch to not grow the stack per call (mirroring what
+// the fast-path loop already does for primitive actions) rather than
+// just raising the number again.
+static constexpr int TW_MAX_DEPTH = 400;
 
 // Default planner wall-clock budget — the industry-standard knob for
 // bounding HTN search instead of relying solely on a static depth limit.
@@ -284,6 +304,105 @@ inline TwWitnessResult tw_witness_oracle_goal_reach(
     return result;
 }
 
+// ── Cached witness scan ─────────────────────────────────────────────────────
+// tw_seek_plan's fast path re-checks tw_witness_oracle_goal_reach on every
+// task it advances past — same as the original recursive code did on every
+// recursive re-entry, one call per task. A full O(remaining) rescan on each
+// of N steps is O(N) + O(N-1) + ... + O(1) = O(N²) for a flat N-task
+// sequence. Almost none of that repeated work is actually state-dependent:
+// a TwCall's classification (does it match an action, a compound task with
+// a method, or neither) is a pure name lookup against the static domain —
+// it can never change no matter what the state is. Only TwGoal/TwMultiGoal
+// entries need re-evaluating against the *current* state each time (their
+// satisfaction, and for TwGoal, which binding is first-unmet, can change as
+// actions execute). Splitting the scan into a one-time static prefix-sum
+// pass (TwCall contributions) plus a per-call walk over just the
+// goal-typed indices (usually a small subset of a large flat todo_list —
+// zero for e.g. skill_allocation.jsonld, which uses only compound method
+// calls) turns the total cost into O(N) + O(N × goals) instead of O(N²),
+// while computing byte-for-byte the same certified/skipped/found result
+// tw_witness_oracle_goal_reach(state, tasks[from_idx..], domain) would.
+struct TwWitnessScanCache {
+    // Prefix sums over the *original* tasks vector this cache was built
+    // from: certified_prefix[i] / skipped_prefix[i] is the static TwCall
+    // contribution from tasks[0..i). Goal/multigoal entries never
+    // contribute here — their contribution is state-dependent and
+    // re-evaluated fresh every query via goal_indices instead.
+    std::vector<int>    certified_prefix;
+    std::vector<int>    skipped_prefix;
+    std::vector<size_t> goal_indices; // indices where tasks[i] is TwGoal or TwMultiGoal
+};
+
+inline TwWitnessScanCache tw_build_witness_scan_cache(
+        const std::vector<TwTask> &tasks, const TwDomain &domain) {
+    TwWitnessScanCache cache;
+    cache.certified_prefix.assign(tasks.size() + 1, 0);
+    cache.skipped_prefix.assign(tasks.size() + 1, 0);
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        int cert = 0, skip = 0;
+        if (const TwCall *call = std::get_if<TwCall>(&tasks[i])) {
+            if (!domain.actions.count(call->name)) {
+                auto mit = domain.task_methods.find(call->name);
+                if (mit != domain.task_methods.end() && !mit->second.empty()) {
+                    cert = 1;
+                } else {
+                    skip = 1;
+                }
+            }
+        } else {
+            cache.goal_indices.push_back(i);
+        }
+        cache.certified_prefix[i + 1] = cache.certified_prefix[i] + cert;
+        cache.skipped_prefix[i + 1]   = cache.skipped_prefix[i] + skip;
+    }
+    return cache;
+}
+
+// Equivalent to tw_witness_oracle_goal_reach(state, span(tasks, from_idx,
+// end), domain) — including the original's quirk that an *unsatisfied*
+// TwMultiGoal contributes to neither certified nor skipped (there's no
+// TwMultiGoal case in the original's certify section, only in its
+// already-satisfied pre-check; replicated here rather than "fixed", since
+// this is a performance change, not a behavior change).
+inline TwWitnessResult tw_witness_oracle_goal_reach_cached(
+        const TwState              &state,
+        const std::vector<TwTask>  &tasks,
+        const TwDomain             &domain,
+        const TwWitnessScanCache   &cache,
+        size_t                      from_idx) {
+
+    int certified = cache.certified_prefix.back() - cache.certified_prefix[from_idx];
+    int skipped   = cache.skipped_prefix.back() - cache.skipped_prefix[from_idx];
+
+    for (size_t gi : cache.goal_indices) {
+        if (gi < from_idx) continue;
+        const TwTask &task = tasks[gi];
+
+        if (const TwGoal *goal = std::get_if<TwGoal>(&task)) {
+            if (goal->is_satisfied(state)) continue;
+            const std::vector<TwGoalBinding> unmet = goal->unsatisfied(state);
+            if (unmet.empty()) continue;
+            auto git = domain.task_methods.find(unmet[0].var);
+            if (git != domain.task_methods.end() && !git->second.empty()) {
+                certified++;
+            } else {
+                skipped++;
+            }
+            continue;
+        }
+        if (const TwMultiGoal *mg = std::get_if<TwMultiGoal>(&task)) {
+            if (mg->is_satisfied(state)) continue;
+            continue; // matches the original: unsatisfied multigoal, no increment either way
+        }
+    }
+
+    TwWitnessResult result;
+    result.found = certified > 0 || skipped == 0;
+    result.certified = certified;
+    result.skipped = skipped;
+    return result;
+}
+
 inline std::optional<std::vector<TwCall>> tw_seek_plan(
         std::shared_ptr<TwState> state,
         std::vector<TwTask>      tasks,
@@ -296,9 +415,11 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan(
         TwMethodStats           *method_stats = nullptr) {
 
     if (budget.exceeded()) throw TwBudgetExceeded{};
-    if (fuel <= 0) return std::nullopt;
     if (tasks.empty()) return std::vector<TwCall>{};
 
+    // Cache key/mark_fail/mark_success are tied to the (state, tasks) this
+    // call was *entered* with — unaffected by the fast-path walk below, so
+    // this call's cached result always means the same thing it always has.
     TwMemoKey cache_key = 0;
     if (fail_cache) {
         cache_key = tw_search_key(*state, tasks);
@@ -317,25 +438,95 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan(
         if (success_cache && cache_key != 0) (*success_cache)[cache_key] = plan;
     };
 
-    std::vector<TwTask> remaining(tasks.begin() + 1, tasks.end());
+    // ── Fast path ────────────────────────────────────────────────────────
+    // Walk consecutive primitive actions and already-satisfied goals in
+    // place, without recursing — a long flat sequence of independent tasks
+    // (e.g. hundreds of unrelated top-level calls) shouldn't grow the C++
+    // call stack or spend fuel: TW_MAX_DEPTH bounds branching-search depth,
+    // not sequence length (see its doc comment), and this used to conflate
+    // the two — a todo_list of a few hundred independent primitive-action
+    // calls would exhaust fuel (or, with fuel raised instead, blow the
+    // stack for real: confirmed by segfaulting a debug build around ~870
+    // consecutive actions) purely from being long, never from any actual
+    // branching. `idx` advances in place instead of `tasks.erase(begin())`
+    // — erasing from the front is itself O(n) per call (shifts every
+    // remaining element down), the same O(n²) trap the cached witness scan
+    // below exists to avoid. Falls through to the branching search below
+    // once tasks[idx] needs a real decision (an unmet goal/multigoal, or a
+    // compound task).
+    //
+    // The witness-oracle check still runs on every single task advanced —
+    // exactly as often as the original per-recursive-call code ran it —
+    // just via tw_witness_oracle_goal_reach_cached instead of a full
+    // O(remaining) rescan each time.
+    TwWitnessScanCache witness_cache = tw_build_witness_scan_cache(tasks, domain);
+    std::vector<TwCall> prefix;
+    size_t idx = 0;
+    for (;;) {
+        if (budget.exceeded()) throw TwBudgetExceeded{};
+        if (idx >= tasks.size()) {
+            mark_success(prefix);
+            return prefix;
+        }
 
-    // ── Witness oracle pre-check (TOHTN, goal-reachability) ─────────────
-    // Before recursing into compound-task dispatch, check if unsatisfied
-    // goals in the task prefix can be reached via their first goal-methods.
-    // If none can, this branch is impossible — skip without expansion.
-    {
-        TwWitnessResult wr = tw_witness_oracle_goal_reach(*state, tasks, domain);
-        if (!wr.found) return mark_fail();
+        {
+            TwWitnessResult wr =
+                tw_witness_oracle_goal_reach_cached(*state, tasks, domain, witness_cache, idx);
+            if (!wr.found) return mark_fail();
+        }
+
+        if (TwGoal *goal = std::get_if<TwGoal>(&tasks[idx])) {
+            if (!goal->is_satisfied(*state)) break; // needs branching search below
+            ++idx;
+            continue;
+        }
+        if (TwMultiGoal *mg = std::get_if<TwMultiGoal>(&tasks[idx])) {
+            if (!mg->is_satisfied(*state)) break; // needs branching search below
+            ++idx;
+            continue;
+        }
+
+        TwCall &call0 = std::get<TwCall>(tasks[idx]);
+        std::unordered_map<std::string, TwActionFn>::const_iterator ait0 =
+            domain.actions.find(call0.name);
+        if (ait0 == domain.actions.end()) break; // compound task — branch below
+
+        // Skip blacklisted commands — specific (action, args) instances that
+        // failed at runtime and must not be replanned (IPyHOP blacklist_command).
+        if (blacklist && blacklist->count(tw_call_key(call0))) return mark_fail();
+
+        std::shared_ptr<TwState> new_state = ait0->second(state->copy(), call0.args);
+        if (!new_state) return mark_fail();
+
+        prefix.push_back(call0);
+        state = new_state;
+        ++idx;
     }
 
-    // --- Conjunctive goal (unigoal) ---
-    if (TwGoal *goal = std::get_if<TwGoal>(&tasks[0])) {
-        if (goal->is_satisfied(*state))
-            return tw_seek_plan(state, remaining, domain, fuel - 1,
-                                blacklist, budget, fail_cache, success_cache, method_stats);
+    // ── Branching search ─────────────────────────────────────────────────
+    // tasks[idx] is now an unmet goal/multigoal or a compound task — the
+    // only place this function actually recurses, so the only place fuel
+    // is spent (one unit per branch attempted, exactly as before).
+    if (fuel <= 0) return mark_fail();
 
+    std::vector<TwTask> remaining(tasks.begin() + idx + 1, tasks.end());
+
+    // Prepend the fast-path prefix to a successful branching result before
+    // caching/returning it — mirrors how the old recursive primitive-action
+    // case built `plan = {call}; plan.insert(..., sub)` in its own frame.
+    auto finish = [&](std::optional<std::vector<TwCall>> result)
+            -> std::optional<std::vector<TwCall>> {
+        if (!result) return mark_fail();
+        std::vector<TwCall> plan = prefix;
+        plan.insert(plan.end(), result->begin(), result->end());
+        mark_success(plan);
+        return plan;
+    };
+
+    // --- Conjunctive goal (unigoal) ---
+    if (TwGoal *goal = std::get_if<TwGoal>(&tasks[idx])) {
         std::vector<TwGoalBinding> unmet = goal->unsatisfied(*state);
-        if (unmet.empty()) return std::nullopt;
+        if (unmet.empty()) return mark_fail();
 
         // Pick first unsatisfied binding; try all goal methods for its var.
         const TwGoalBinding &b = unmet[0];
@@ -366,8 +557,7 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan(
                             blacklist, budget, fail_cache, success_cache, method_stats);
             if (result) {
                 tw_note_method_result(gkey, midx, true, method_stats);
-                mark_success(*result);
-                return result;
+                return finish(result);
             }
             tw_note_method_result(gkey, midx, false, method_stats);
         }
@@ -375,18 +565,14 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan(
     }
 
     // --- Multigoal (RECTGTN 'N'): backtrack over which binding to satisfy first ---
-    if (TwMultiGoal *mg = std::get_if<TwMultiGoal>(&tasks[0])) {
-        if (mg->is_satisfied(*state))
-            return tw_seek_plan(state, remaining, domain, fuel - 1,
-                                blacklist, budget, fail_cache, success_cache, method_stats);
-
+    if (TwMultiGoal *mg = std::get_if<TwMultiGoal>(&tasks[idx])) {
         std::vector<TwGoalBinding> unmet = mg->unsatisfied(*state);
         if (unmet.empty()) return mark_fail();
 
         // Try each unsatisfied binding as the next thing to satisfy (IPyHOP _mg).
-        for (size_t idx = 0; idx < unmet.size(); ++idx) {
+        for (size_t uidx = 0; uidx < unmet.size(); ++uidx) {
             TwGoal sub_goal;
-            sub_goal.bindings = {unmet[idx]};
+            sub_goal.bindings = {unmet[uidx]};
 
             std::vector<TwTask> new_tasks;
             new_tasks.push_back(sub_goal);
@@ -395,38 +581,13 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan(
             std::optional<std::vector<TwCall>> result =
                 tw_seek_plan(state, new_tasks, domain, fuel - 1,
                             blacklist, budget, fail_cache, success_cache, method_stats);
-            if (result) {
-                mark_success(*result);
-                return result;
-            }
+            if (result) return finish(result);
         }
         return mark_fail();
     }
 
-    // --- Primitive action or compound task ---
-    TwCall &call = std::get<TwCall>(tasks[0]);
-
-    // Primitive action (RECTGTN 'E' — a command that can fail at runtime).
-    std::unordered_map<std::string, TwActionFn>::const_iterator ait =
-        domain.actions.find(call.name);
-    if (ait != domain.actions.end()) {
-        // Skip blacklisted commands — specific (action, args) instances that
-        // failed at runtime and must not be replanned (IPyHOP blacklist_command).
-        if (blacklist && blacklist->count(tw_call_key(call))) return mark_fail();
-
-        std::shared_ptr<TwState> new_state = ait->second(state->copy(), call.args);
-        if (!new_state) return mark_fail();
-        std::optional<std::vector<TwCall>> sub =
-            tw_seek_plan(new_state, remaining, domain, fuel - 1,
-                         blacklist, budget, fail_cache, success_cache, method_stats);
-        if (!sub) return mark_fail();
-        std::vector<TwCall> plan = {call};
-        plan.insert(plan.end(), sub->begin(), sub->end());
-        mark_success(plan);
-        return plan;
-    }
-
-    // Compound task: try each method in order
+    // --- Compound task: try each method in order ---
+    TwCall &call = std::get<TwCall>(tasks[idx]);
     std::unordered_map<std::string, std::vector<TwMethodFn>>::const_iterator mit =
         domain.task_methods.find(call.name);
     if (mit != domain.task_methods.end()) {
@@ -448,8 +609,7 @@ inline std::optional<std::vector<TwCall>> tw_seek_plan(
                             blacklist, budget, fail_cache, success_cache, method_stats);
             if (result) {
                 tw_note_method_result(tkey, midx, true, method_stats);
-                mark_success(*result);
-                return result;
+                return finish(result);
             }
             tw_note_method_result(tkey, midx, false, method_stats);
         }
